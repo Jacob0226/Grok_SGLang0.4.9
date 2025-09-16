@@ -447,9 +447,7 @@ __inline__ __device__ void _paged_attention_kernel(
     }
     __syncthreads(); // sync before writing to shared mem
 
-    // Seg 6
-    // Seg 6.1
-    // DEBUG_MARKER(12); DEBUG_MARKER(12);
+    DEBUG_MARKER(12); DEBUG_MARKER(12);
     float* shared_mem = reinterpret_cast<float*>(shared_logits);
     if (laneid < 16) {
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -463,10 +461,9 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     __syncthreads();
-    
-    // Seg 6.2
+
     // calculate partition qk_max and exp_sum
-    // DEBUG_MARKER(13); DEBUG_MARKER(13);
+    DEBUG_MARKER(13); DEBUG_MARKER(13);
     float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
     float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
     float partition_exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
@@ -491,48 +488,51 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     __syncthreads();
+    // disable rtz conversion due to its impact on accuracy.
+    // Seg 7
+    // Seg 7.1
+    constexpr bool LOGITS_RTZ_CONVERSION = false;
 
-    // // disable rtz conversion due to its impact on accuracy.
-    // DEBUG_MARKER(14); DEBUG_MARKER(14);
-    // constexpr bool LOGITS_RTZ_CONVERSION = false;
+    // write logits to shared mem
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        for (int mtp = 0; mtp < mtp_loop; mtp++) {
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
+                d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+                if constexpr (LOGITS_RTZ_CONVERSION) {
+                    // use rtz conversion for better performance, with negligible impact on
+                    // accuracy
+                    shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id][rowid] =
+                        from_floatx4_rtz<scalar_t>(d_out[gqa_ratio_loop][mtp][token_depth]);
+                } else {
+                    shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id][rowid] =
+                        from_floatx4<scalar_t>(d_out[gqa_ratio_loop][mtp][token_depth]);
+                }
+            }
+        }
+    }
 
-    // // write logits to shared mem
-    // for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
-    //     for (int mtp = 0; mtp < mtp_loop; mtp++) {
-    //         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-    //             d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
-    //             if constexpr (LOGITS_RTZ_CONVERSION) {
-    //                 // use rtz conversion for better performance, with negligible impact on
-    //                 // accuracy
-    //                 shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id][rowid] =
-    //                     from_floatx4_rtz<scalar_t>(d_out[gqa_ratio_loop][mtp][token_depth]);
-    //             } else {
-    //                 shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id][rowid] =
-    //                     from_floatx4<scalar_t>(d_out[gqa_ratio_loop][mtp][token_depth]);
-    //             }
-    //         }
-    //     }
-    // }
+    // Seg 7.2
     // // write out partition max_logits and exp_sum
-    // DEBUG_MARKER(15); DEBUG_MARKER(15);
-    // if (threadIdx.x < GQA_RATIO_MTP_PARALLEL) {
-    //     for(int mtp = 0; mtp < mtp_loop; mtp++) {
-    //         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-    //             const int qhead_idx = lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
-    //             const int64_t offset = static_cast<int64_t>(seq_idx + mtp * MTP_PARALLEL_THREADS) *
-    //                                     static_cast<int64_t>(total_num_heads) *
-    //                                     static_cast<int64_t>(max_num_partitions) +
-    //                                 (static_cast<int64_t>(wg_start_head_idx) +
-    //                                     static_cast<int64_t>(qhead_idx)) *
-    //                                     static_cast<int64_t>(max_num_partitions) +
-    //                                 static_cast<int64_t>(partition_idx);
-    //             max_logits[offset] = partition_qk_max[gqa_ratio_loop][mtp];
-    //             exp_sums[offset] = partition_exp_sum[gqa_ratio_loop][mtp];
-    //         }
-    //     }
-    // }
+    if (threadIdx.x < GQA_RATIO_MTP_PARALLEL) {
+        for(int mtp = 0; mtp < mtp_loop; mtp++) {
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
+                const int qhead_idx = lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
+                const int64_t offset = static_cast<int64_t>(seq_idx + mtp * MTP_PARALLEL_THREADS) *
+                                        static_cast<int64_t>(total_num_heads) *
+                                        static_cast<int64_t>(max_num_partitions) +
+                                    (static_cast<int64_t>(wg_start_head_idx) +
+                                        static_cast<int64_t>(qhead_idx)) *
+                                        static_cast<int64_t>(max_num_partitions) +
+                                    static_cast<int64_t>(partition_idx);
+                max_logits[offset] = partition_qk_max[gqa_ratio_loop][mtp];
+                exp_sums[offset] = partition_exp_sum[gqa_ratio_loop][mtp];
+            }
+        }
+    }
 
-    // __syncthreads();
+    __syncthreads();
+
+    // Seg 7.3
     // DEBUG_MARKER(16); DEBUG_MARKER(16);
 
     // constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;

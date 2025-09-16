@@ -1,3 +1,7 @@
 prof/
 aiter/
 sglang/
+
+!aiter/csrc/cpp_itfs/pa/Jacob
+!sglang/python/sglang/bench_one_batch.py
+!prof/*.sh

@@ -464,33 +464,33 @@ __inline__ __device__ void _paged_attention_kernel(
 
     __syncthreads();
     
-    // Seg 6.2
-    // calculate partition qk_max and exp_sum
-    // DEBUG_MARKER(13); DEBUG_MARKER(13);
-    float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
-    float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
-    float partition_exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
+    // // Seg 6.2
+    // // calculate partition qk_max and exp_sum
+    // // DEBUG_MARKER(13); DEBUG_MARKER(13);
+    // float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
+    // float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
+    // float partition_exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
 
-    for(int mtp = 0; mtp < mtp_loop; mtp++) {
-        for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-            float warp_qk_max_exp[NWARPS];
-            for (int w = 0; w < NWARPS; w++) {
-                warp_qk_max_exp[w] = shared_mem[w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD + (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD + mtp];
-                partition_qk_max[gqa_ratio_loop][mtp] = fmaxf(partition_qk_max[gqa_ratio_loop][mtp], warp_qk_max_exp[w]);
-            }
+    // for(int mtp = 0; mtp < mtp_loop; mtp++) {
+    //     for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
+    //         float warp_qk_max_exp[NWARPS];
+    //         for (int w = 0; w < NWARPS; w++) {
+    //             warp_qk_max_exp[w] = shared_mem[w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD + (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD + mtp];
+    //             partition_qk_max[gqa_ratio_loop][mtp] = fmaxf(partition_qk_max[gqa_ratio_loop][mtp], warp_qk_max_exp[w]);
+    //         }
 
-            for (int w = 0; w < NWARPS; w++) {
-                warp_qk_max_exp[w] = __expf(warp_qk_max_exp[w] - partition_qk_max[gqa_ratio_loop][mtp]);
-                partition_exp_sum[gqa_ratio_loop][mtp] +=
-                    shared_mem[NWARPS * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD +  w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD + (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD + mtp] * warp_qk_max_exp[w];
-            }
+    //         for (int w = 0; w < NWARPS; w++) {
+    //             warp_qk_max_exp[w] = __expf(warp_qk_max_exp[w] - partition_qk_max[gqa_ratio_loop][mtp]);
+    //             partition_exp_sum[gqa_ratio_loop][mtp] +=
+    //                 shared_mem[NWARPS * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD +  w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD + (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD + mtp] * warp_qk_max_exp[w];
+    //         }
             
-            inv_sum_scale[gqa_ratio_loop][mtp] =
-                    __fdividef(1.f, partition_exp_sum[gqa_ratio_loop][mtp] + 1e-6f) * warp_qk_max_exp[warpid];
-        }
-    }
+    //         inv_sum_scale[gqa_ratio_loop][mtp] =
+    //                 __fdividef(1.f, partition_exp_sum[gqa_ratio_loop][mtp] + 1e-6f) * warp_qk_max_exp[warpid];
+    //     }
+    // }
 
-    __syncthreads();
+    // __syncthreads();
 
     // // disable rtz conversion due to its impact on accuracy.
     // DEBUG_MARKER(14); DEBUG_MARKER(14);
