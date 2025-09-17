@@ -40,6 +40,7 @@ __inline__ __device__ void _paged_attention_kernel(
     const float* v_scale_ptr,
     const AttentionVariant* variant)
 {
+    // Seg 2
     const int seq_idx = blockIdx.x;
     const int partition_idx = blockIdx.y;
     const int kv_head_idx = blockIdx.z;
@@ -182,6 +183,7 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
 
+    // Seg 3
     // set to true to enable non temporal kv loads: has some benefit in very high
     // batch size cases
     DEBUG_MARKER(5); DEBUG_MARKER(5);
@@ -266,6 +268,7 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
 
+    // Seg 4
     _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; // this can be interpreted as B8x16 too
     __shared__ unsigned char vlds_ptr[TOKENS_PER_WARP * n_thread_per_block * 16];
     static_assert(VBLOCKS_PER_LANE == VTLANELOOP,
@@ -374,6 +377,7 @@ __inline__ __device__ void _paged_attention_kernel(
     }
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
 
+    // Seg 5
     // apply alibi
     DEBUG_MARKER(9); DEBUG_MARKER(9);
     if constexpr (ALIBI_ENABLED) {
@@ -447,6 +451,8 @@ __inline__ __device__ void _paged_attention_kernel(
     }
     __syncthreads(); // sync before writing to shared mem
 
+    // Seg 6
+    // Seg 6.1
     DEBUG_MARKER(12); DEBUG_MARKER(12);
     float* shared_mem = reinterpret_cast<float*>(shared_logits);
     if (laneid < 16) {
@@ -462,6 +468,7 @@ __inline__ __device__ void _paged_attention_kernel(
 
     __syncthreads();
 
+    // Seg 6.2
     // calculate partition qk_max and exp_sum
     DEBUG_MARKER(13); DEBUG_MARKER(13);
     float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
@@ -488,8 +495,10 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     __syncthreads();
+
+    // Seg 7
+    // Seg 7.1
     // disable rtz conversion due to its impact on accuracy.
-    DEBUG_MARKER(14); DEBUG_MARKER(14);
     constexpr bool LOGITS_RTZ_CONVERSION = false;
 
     // write logits to shared mem
@@ -509,6 +518,8 @@ __inline__ __device__ void _paged_attention_kernel(
             }
         }
     }
+
+    // Seg 7.2
     // write out partition max_logits and exp_sum
     DEBUG_MARKER(15); DEBUG_MARKER(15);
     if (threadIdx.x < GQA_RATIO_MTP_PARALLEL) {
@@ -529,8 +540,8 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     __syncthreads();
-    DEBUG_MARKER(16); DEBUG_MARKER(16);
 
+    // Seg 7.3
     constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;
     constexpr int ELEMS16_ELEMS8_RATIO = 16 / 8;
 
@@ -579,6 +590,7 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
     
+    // Seg 8
     _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
 
     // Softmax V mfma
