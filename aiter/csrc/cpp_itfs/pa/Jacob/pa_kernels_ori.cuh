@@ -131,8 +131,6 @@ __inline__ __device__ void _paged_attention_kernel(
     const int64_t query_start_off = static_cast<int64_t>(query_loc + warp_mtp_idx);
     constexpr int mtp_loop = MTP_PER_THREAD;
 
-    DEBUG_MARKER(3); DEBUG_MARKER(3);
-
     for(int mtp = 0; mtp < mtp_loop; mtp++) {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
             const scalar_t* q_ptr =
@@ -166,7 +164,6 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
     __syncthreads();
-    DEBUG_MARKER(4); DEBUG_MARKER(4);
     for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
         for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
             for (int i = 0; i < 2; i++) {
@@ -186,7 +183,6 @@ __inline__ __device__ void _paged_attention_kernel(
     // Seg 3
     // set to true to enable non temporal kv loads: has some benefit in very high
     // batch size cases
-    DEBUG_MARKER(5); DEBUG_MARKER(5);
     constexpr bool NT_KV_LOAD = false;
 
     constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
@@ -253,7 +249,6 @@ __inline__ __device__ void _paged_attention_kernel(
     int vphysical_block_number[VTLOOP][VBLOCKS_PER_LANE];
 
     // fetch v physical block numbers
-    DEBUG_MARKER(6); DEBUG_MARKER(6);
     for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
     {
         for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
@@ -278,7 +273,6 @@ __inline__ __device__ void _paged_attention_kernel(
                            ((threadIdx.x / n_thread_per_block) % BLOCK_SIZE) * kv_seq_stride;
 
     // v fetches are 16head elems across lanes x 16 tokens per lane
-    DEBUG_MARKER(7); DEBUG_MARKER(7);
     for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
     {
         for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
@@ -322,7 +316,6 @@ __inline__ __device__ void _paged_attention_kernel(
 
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
-    DEBUG_MARKER(8); DEBUG_MARKER(8);
     for (int mtp = 0; mtp < mtp_loop; mtp++) {
         for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
             for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
@@ -379,7 +372,6 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 5
     // apply alibi
-    DEBUG_MARKER(9); DEBUG_MARKER(9);
     if constexpr (ALIBI_ENABLED) {
         for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
             const int local_token_idx = qkout_token_idx + token_depth * 16;
@@ -394,7 +386,6 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
     // apply soft-capping to logits
-    DEBUG_MARKER(10); DEBUG_MARKER(10);
     for (int token_depth = 0; token_depth < TLOOP; token_depth++)
     {
         for (int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -413,7 +404,6 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     // calculate qk_max and exp_sum per warp and write to shared memory
-    DEBUG_MARKER(11); DEBUG_MARKER(11);
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
     float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
 
@@ -453,7 +443,10 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 6
     // Seg 6.1
-    DEBUG_MARKER(12); DEBUG_MARKER(12);
+
+    __builtin_amdgcn_sched_barrier(0);
+    DEBUG_MARKER(2); DEBUG_MARKER(2); DEBUG_MARKER(2);
+    __builtin_amdgcn_sched_barrier(0);
     float* shared_mem = reinterpret_cast<float*>(shared_logits);
     if (laneid < 16) {
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -467,10 +460,12 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     __syncthreads();
+    __builtin_amdgcn_sched_barrier(0);
+    DEBUG_MARKER(0); DEBUG_MARKER(0); DEBUG_MARKER(0);
+    __builtin_amdgcn_sched_barrier(0);
 
     // Seg 6.2
     // calculate partition qk_max and exp_sum
-    DEBUG_MARKER(13); DEBUG_MARKER(13);
     float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
     float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
     float partition_exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
@@ -521,7 +516,6 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 7.2
     // write out partition max_logits and exp_sum
-    DEBUG_MARKER(15); DEBUG_MARKER(15);
     if (threadIdx.x < GQA_RATIO_MTP_PARALLEL) {
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
@@ -542,6 +536,9 @@ __inline__ __device__ void _paged_attention_kernel(
     __syncthreads();
 
     // Seg 7.3
+    __builtin_amdgcn_sched_barrier(0);
+    DEBUG_MARKER(3); DEBUG_MARKER(3); DEBUG_MARKER(3);
+    __builtin_amdgcn_sched_barrier(0);
     constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;
     constexpr int ELEMS16_ELEMS8_RATIO = 16 / 8;
 
@@ -589,13 +586,15 @@ __inline__ __device__ void _paged_attention_kernel(
             __syncthreads();
         }
     }
+    __builtin_amdgcn_sched_barrier(0);
+    DEBUG_MARKER(0); DEBUG_MARKER(0); DEBUG_MARKER(0);
+    __builtin_amdgcn_sched_barrier(0);
     
     // Seg 8
     _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
 
     // Softmax V mfma
     // v layout: 16he across lanes x 16 tokens per lane
-    DEBUG_MARKER(17); DEBUG_MARKER(17);
     for (int mtp = 0; mtp < mtp_loop; mtp++) {
         for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
             for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
@@ -697,7 +696,6 @@ __inline__ __device__ void _paged_attention_kernel(
     __syncthreads();
 
     // store Softmax-V mfma output to shared mem
-    DEBUG_MARKER(18); DEBUG_MARKER(18);
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
         // lane16 id head dimension; rowid head element dimension
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -710,7 +708,6 @@ __inline__ __device__ void _paged_attention_kernel(
     __syncthreads();
 
     // write to tmp_out with coalesced writes after reading from shared mem
-    DEBUG_MARKER(19); DEBUG_MARKER(19);
     if (warpid == 0) {
         for (int mtp = 0; mtp < mtp_loop; mtp++) {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
