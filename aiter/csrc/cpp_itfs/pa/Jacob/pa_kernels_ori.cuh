@@ -3,7 +3,10 @@
 #include "pa_common.cuh"
 
 // Jacob Debug
-#define DEBUG_MARKER(id) asm volatile("s_nop " #id)
+#define DEBUG_MARKER(INFO) \
+    __builtin_amdgcn_s_barrier(); \
+    asm volatile ("; [DEBUG] " INFO); \
+    __builtin_amdgcn_s_barrier();
 
 template <typename scalar_t,
           typename cache_t,
@@ -41,6 +44,7 @@ __inline__ __device__ void _paged_attention_kernel(
     const AttentionVariant* variant)
 {
     // Seg 2
+    DEBUG_MARKER("Seg 2");
     const int seq_idx = blockIdx.x;
     const int partition_idx = blockIdx.y;
     const int kv_head_idx = blockIdx.z;
@@ -181,6 +185,7 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     // Seg 3
+    DEBUG_MARKER("Seg 3")
     // set to true to enable non temporal kv loads: has some benefit in very high
     // batch size cases
     constexpr bool NT_KV_LOAD = false;
@@ -264,6 +269,7 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     // Seg 4
+    DEBUG_MARKER("Seg 4");
     _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; // this can be interpreted as B8x16 too
     __shared__ unsigned char vlds_ptr[TOKENS_PER_WARP * n_thread_per_block * 16];
     static_assert(VBLOCKS_PER_LANE == VTLANELOOP,
@@ -371,6 +377,7 @@ __inline__ __device__ void _paged_attention_kernel(
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
 
     // Seg 5
+    DEBUG_MARKER("Seg 5");
     // apply alibi
     if constexpr (ALIBI_ENABLED) {
         for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
@@ -443,10 +450,7 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 6
     // Seg 6.1
-
-    __builtin_amdgcn_sched_barrier(0);
-    DEBUG_MARKER(2); DEBUG_MARKER(2); DEBUG_MARKER(2);
-    __builtin_amdgcn_sched_barrier(0);
+    DEBUG_MARKER("Seg 6.1");
     float* shared_mem = reinterpret_cast<float*>(shared_logits);
     if (laneid < 16) {
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -460,11 +464,9 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     __syncthreads();
-    __builtin_amdgcn_sched_barrier(0);
-    DEBUG_MARKER(0); DEBUG_MARKER(0); DEBUG_MARKER(0);
-    __builtin_amdgcn_sched_barrier(0);
 
     // Seg 6.2
+    DEBUG_MARKER("Seg 6.2");
     // calculate partition qk_max and exp_sum
     float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
     float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
@@ -493,6 +495,7 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 7
     // Seg 7.1
+    DEBUG_MARKER("Seg 7.1");
     // disable rtz conversion due to its impact on accuracy.
     constexpr bool LOGITS_RTZ_CONVERSION = false;
 
@@ -515,6 +518,7 @@ __inline__ __device__ void _paged_attention_kernel(
     }
 
     // Seg 7.2
+    DEBUG_MARKER("Seg 7.2");
     // write out partition max_logits and exp_sum
     if (threadIdx.x < GQA_RATIO_MTP_PARALLEL) {
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -536,9 +540,7 @@ __inline__ __device__ void _paged_attention_kernel(
     __syncthreads();
 
     // Seg 7.3
-    __builtin_amdgcn_sched_barrier(0);
-    DEBUG_MARKER(3); DEBUG_MARKER(3); DEBUG_MARKER(3);
-    __builtin_amdgcn_sched_barrier(0);
+    DEBUG_MARKER("Seg 7.3");
     constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;
     constexpr int ELEMS16_ELEMS8_RATIO = 16 / 8;
 
@@ -586,11 +588,10 @@ __inline__ __device__ void _paged_attention_kernel(
             __syncthreads();
         }
     }
-    __builtin_amdgcn_sched_barrier(0);
-    DEBUG_MARKER(0); DEBUG_MARKER(0); DEBUG_MARKER(0);
-    __builtin_amdgcn_sched_barrier(0);
+
     
     // Seg 8
+    DEBUG_MARKER("Seg 8");
     _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
 
     // Softmax V mfma

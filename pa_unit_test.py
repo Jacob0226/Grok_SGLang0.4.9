@@ -180,7 +180,7 @@ def test_paged_attention(
 ) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
-    torch.set_default_device(device)
+    torch.set_default_device(device)  
 
     # Using default kv_scale
     k_scale = v_scale = torch.tensor([1.0], dtype=dtypes.fp32)
@@ -267,6 +267,26 @@ def test_paged_attention(
         key_cache_new = rearrange(key_cache_new, "b h s d -> b s h d")
         value_cache_new = rearrange(value_cache_new, "b h s d -> b s h d")
 
+    # Warmup 5 iter
+    for i in range(5):
+        _ = run_aiter(
+            query,
+            key_cache_new.contiguous(),
+            value_cache_new.contiguous(),
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            max_seq_len,
+            kv_cache_dtype,
+            kv_cache_layout,
+            num_kv_heads,
+            scale,
+            alibi_slopes,
+            logits_soft_cap,
+            k_scale,
+            v_scale,
+        )
+
     out_golden = run_aiter(
         query,
         key_cache_new.contiguous(),
@@ -280,7 +300,7 @@ def test_paged_attention(
         num_kv_heads,
         scale,
         alibi_slopes,
-        0.0,
+        logits_soft_cap,
         k_scale,
         v_scale,
     )
@@ -346,7 +366,7 @@ if __name__ == "__main__":
         dtypes.bf16, # dtype
         "auto",   # kv_cache_dtype
         "HND",    # kv_cache_layout
-        0.0,      # logits_soft_cap
+        30.0,      # logits_soft_cap
         pa_variant,
         quant_cache_dtype,
         0,        # seed
