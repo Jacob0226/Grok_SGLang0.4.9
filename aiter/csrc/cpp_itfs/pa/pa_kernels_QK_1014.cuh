@@ -183,9 +183,9 @@ __inline__ __device__ void _paged_attention_kernel(
                         int bank_idx1 = (relative_byte_offset1 / 4) % 32;
                         // if (threadIdx.x < 32 && warpid == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
                         //     printf("[HIP] [global->LDS] threadIdx=%3d, offset1=%d, lane4id=%3d,qhead_element=%3d, local_qhead_idx=%d, local_mtp_qhead_idx=%d,"
-                        //            "shared_logits[%d][%d][%d][%d][%d][%d][0], bank_idx0=%d, bank_idx1=%d\n",
+                        //            "shared_logits[%d][%d][%d][offset1=%d][lane4id=%d][local_qhead_idx=%d][0|1], \n", // bank_idx0=%d, bank_idx1=%d
                         //         threadIdx.x, offset1, lane4id, qhead_element, local_qhead_idx, local_mtp_qhead_idx,
-                        //         gqa_ratio_loop, head_loop, mtp, offset1, lane4id, local_qhead_idx, bank_idx0, bank_idx1); 
+                        //         gqa_ratio_loop, head_loop, mtp, offset1, lane4id, local_qhead_idx /*,bank_idx0, bank_idx1*/); 
                         // }
                     } else {
                         for (int i = 0; i < 2; i++) {
@@ -201,98 +201,8 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
     __syncthreads();
-    for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) { // 4
-        for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) { // 1
-            for (int i = 0; i < 2; i++) {
-                for(int mtp = 0; mtp < mtp_loop; mtp++) { // 1
-                    for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) { //1
-                        for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) { // 1
-                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i] =
-                                shared_logits[gqa_ratio_loop][head_loop][mtp][qkhe_depth][rowid][lane16id % GQA_RATIO_MTP_PARALLEL]
-                                            [2 * qkratio + i];
 
-                            uintptr_t byte_address = 
-                                reinterpret_cast<uintptr_t>(&shared_logits[gqa_ratio_loop][head_loop][mtp]
-                                    [qkhe_depth][rowid][lane16id % GQA_RATIO_MTP_PARALLEL][2 * qkratio + i]);
-                            uintptr_t shared_logits_base = reinterpret_cast<uintptr_t>(shared_logits);
-                            size_t relative_byte_offset = byte_address - shared_logits_base;
-                            int bank_idx = (relative_byte_offset / 4) % 32;
-                            // if (threadIdx.x < 8 && warpid == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                            //     printf("[HIP] [LDS->Register] threadIdx=%3d, "
-                            //         "shared_logits[%d][%d][%d][%d][%d][%d][%d], bank_idx=%d, \n",
-                            //         threadIdx.x, 
-                            //         gqa_ratio_loop, head_loop, mtp, qkhe_depth, rowid, lane16id % GQA_RATIO_MTP_PARALLEL,
-                            //         2 * qkratio + i, bank_idx); 
-                            // }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
-    // Seg 3
-    DEBUG_MARKER("Seg 3")
-    // set to true to enable non temporal kv loads: has some benefit in very high
-    // batch size cases
-    constexpr bool NT_KV_LOAD = false;
-
-    constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
-    const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
-
-    // Jacob: CONTIGUOUS_KV_ELEMS_16B_LOAD is the offset
-    //    this kernel treat 1 wavefront = 64 thread into 4x16 threads.
-    //    4 means the rowid, 16 is the lane16id
-    //    E.g., thread {0, 16, 32, 48} are lane16id=0, but these 4 threads are belong to rowid {0,1,2,3}
-    //    What does it mean? these 4 threads cooperate to load 64 bytes in 1 QKHELOOP iteration
-    //    Thread  0 load data from addr  0~16 byte,
-    //    Thread 16 load data from addr 16~32 byte,
-    //    Thread 32 load data from addr 32~48 byte,
-    //    Thread 48 load data from addr 48~64 byte,
-    //    So, CONTIGUOUS_KV_ELEMS_16B_LOAD is used to tell these 4 threads with the correct offset
-    //    Thread  0, rowid=0, row_head_elem=0x8 elements
-    //    Thread 16, rowid=1, row_head_elem=1x8 elements
-    //    Thread 32, rowid=2, row_head_elem=2x8 elements
-    //    Thread 48, rowid=3, row_head_elem=3x8 elements
-    const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD; 
-    // fetch K values
-    for(int token_depth = 0; token_depth < TLOOP; token_depth++) // 4, 4 thread load 4 token
-    {
-        const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[token_depth]);
-        const cache_t* k_ptr2       = k_ptr + kblock_number * kv_block_stride;
-        const int klocal_token_idx  = TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
-        const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
-        const int kphysical_block_offset = klocal_token_idx % BLOCK_SIZE;
-        const cache_t* k_ptr3            = k_ptr2 + kphysical_block_offset * kv_seq_stride;
-
-        for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) // 4, each thread load 16byte, so 4t load 64B, 4 iter load 256 Byte which match head_dim=128 elems(256B)
-        {
-            for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
-                const int head_elem           = row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
-                const int offset1             = head_elem / KX;
-                const int offset2             = head_elem % KX;
-                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
-                const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
-                if constexpr(NT_KV_LOAD)
-                {
-                    Klocal[head_loop][token_depth][qkhe_depth] = load_ntmprl_16Byte(k_fetch_ptr_16B);
-                }
-                else
-                {
-                    Klocal[head_loop][token_depth][qkhe_depth] = *k_fetch_ptr_16B;
-
-                    // if (threadIdx.x %16 == 0 && warpid == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                    //     uintptr_t byte_address = reinterpret_cast<uintptr_t>(k_fetch_ptr_16B);
-                    //     printf("[HIP] [K cache] threadIdx=%3d, token_depth=%3d, qkhe_depth=%3d, "
-                    //            "kblock_number=%d, Klocal[%d][%d][%d], load from global V addr: %llu\n",
-                    //             threadIdx.x, token_depth, qkhe_depth, 
-                    //             kblock_number, head_loop, token_depth, qkhe_depth,
-                    //             (unsigned long long)byte_address); 
-                    // }
-                }
-            }
-        }
-    }
 
     float alibi_slope[GQA_RATIO_LOOP];
     if constexpr(ALIBI_ENABLED)
@@ -391,48 +301,104 @@ __inline__ __device__ void _paged_attention_kernel(
     }();
 
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
+
+
     // qk mfma
-    for (int mtp = 0; mtp < mtp_loop; mtp++) {
-        for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
-            for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
+    // qk mfma - K related variables
+    constexpr bool NT_KV_LOAD = false;
+    constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
+    const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
+    const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD; 
+    int curr = 0, next = 1;
+    _B16x8 Kbuffer[2][HEAD_LOOP][QKHELOOP]; // curr and next K buffer
+
+    // qk mfma - define lambda: loading K 
+    auto load_K_fragment = [&] __device__ (const cache_t* k_ptr3, int buf_idx) {
+        for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
+            for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
+                const int head_elem = row_head_elem + qkhe_depth * QKHE_PER_FETCH
+                                    + head_loop * HEAD_SIZE_PER_LOOP;
+                const int offset1             = head_elem / KX;
+                const int offset2             = head_elem % KX;
+                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
+                const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
+
+                if constexpr (NT_KV_LOAD)
+                    Kbuffer[buf_idx][head_loop][qkhe_depth] = load_ntmprl_16Byte(k_fetch_ptr_16B);
+                else
+                    Kbuffer[buf_idx][head_loop][qkhe_depth] = *k_fetch_ptr_16B;
+            }
+        }
+    };
+
+    for (int mtp = 0; mtp < mtp_loop; mtp++) { // 1 
+        // Before starting, load the first K cache
+        const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[0]);
+        const cache_t* k_ptr2       = k_ptr + kblock_number * kv_block_stride;
+        const int klocal_token_idx  = TOKENS_PER_WARP * warpid + 0 * 16 + lane16id;
+        const int kphysical_block_offset = klocal_token_idx % BLOCK_SIZE;
+        const cache_t* k_ptr3_init       = k_ptr2 + kphysical_block_offset * kv_seq_stride;
+        load_K_fragment(k_ptr3_init, 0);
+
+        for (int token_depth = 0; token_depth < TLOOP; token_depth++) { // 4
+            // Preload the next K cache
+            if (token_depth + 1 < TLOOP){
+                const int64_t kblock_number_next = static_cast<int64_t>(kphysical_block_number[token_depth + 1]);
+                const cache_t* k_ptr2_next       = k_ptr + kblock_number_next * kv_block_stride;
+                const int klocal_token_idx_next  = TOKENS_PER_WARP * warpid + (token_depth + 1) * 16 + lane16id;
+                const int kphysical_block_offset_next = klocal_token_idx_next % BLOCK_SIZE;
+                const cache_t* k_ptr3_next            = k_ptr2_next + kphysical_block_offset_next * kv_seq_stride;
+
+                load_K_fragment(k_ptr3_next, next);
+            }
+                 
+            for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) { // 1
                 d_out[gqa_ratio_loop][mtp][token_depth] = {0};
-                for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
-                    for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) { // QKHELOOP=
-                        // Interleave K loading 16x32 (TokenxHead_dim) here?
-                        if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
-                            for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {  // QK_SIZE_RATIO=1
+                for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) { // 1
+                    for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) { // 4
+                        for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
+                            // Load Q from LDS
+                            for (int i = 0; i < 2; i++) 
+                                Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i] =
+                                    shared_logits[gqa_ratio_loop][head_loop][mtp][qkhe_depth][rowid]
+                                    [lane16id % GQA_RATIO_MTP_PARALLEL][2 * qkratio + i];
+                            if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
+
                                 #if defined(__gfx950__)
                                 d_out[gqa_ratio_loop][mtp][token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                    Klocal[head_loop][token_depth][qkhe_depth],
+                                    Kbuffer[curr][head_loop][qkhe_depth],
                                     Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
                                     d_out[gqa_ratio_loop][mtp][token_depth]);
                                 #else
                                 for (int i = 0; i < 2; i++) {
                                     d_out[gqa_ratio_loop][mtp][token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                        Klocal[head_loop][token_depth][qkhe_depth].xy[i],
+                                        Kbuffer[curr][head_loop][qkhe_depth].xy[i],
                                         Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i],
                                         d_out[gqa_ratio_loop][mtp][token_depth]);
                                 }
                                 #endif
                             }
-                        } else {  // kv cache dtype fp8
-                            auto Ktmp = Klocal[head_loop][token_depth][qkhe_depth];
-                            _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
-                            for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
-                                _B8x8 Ktmp8x8 = Ktmp8x16.xy[qkratio];
-                                _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
-                                #if defined(__gfx950__)
-                                d_out[gqa_ratio_loop][mtp][token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                                    Klocaltmp,
-                                    Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
-                                    d_out[gqa_ratio_loop][mtp][token_depth]);
-                                #else
-                                for (int i = 0; i < 2; i++) {
-                                    d_out[gqa_ratio_loop][mtp][token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                                        Klocaltmp.xy[i], Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i],
+                            else {  // kv cache dtype fp8
+                                auto Ktmp = Kbuffer[curr][head_loop][qkhe_depth];
+                                _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+                                for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
+                                    // Load Q from LDS
+
+                                    _B8x8 Ktmp8x8 = Ktmp8x16.xy[qkratio];
+                                    _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
+                                    #if defined(__gfx950__)
+                                    d_out[gqa_ratio_loop][mtp][token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                        Klocaltmp,
+                                        Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
                                         d_out[gqa_ratio_loop][mtp][token_depth]);
+                                    #else
+                                    for (int i = 0; i < 2; i++) {
+                                        d_out[gqa_ratio_loop][mtp][token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                            Klocaltmp.xy[i], Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i],
+                                            d_out[gqa_ratio_loop][mtp][token_depth]);
+                                    }
+                                    #endif
                                 }
-                                #endif
                             }
                         }
                     }
@@ -442,7 +408,10 @@ __inline__ __device__ void _paged_attention_kernel(
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = variant->QueryTransform(variant_params, d_out[gqa_ratio_loop][mtp][token_depth][i]);
                 }
                 
-            } 
+            }
+            int tmp = curr;
+            curr = next;
+            next = tmp;
         }
     }
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
