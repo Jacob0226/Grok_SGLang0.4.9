@@ -115,36 +115,7 @@ __inline__ __device__ void _paged_attention_kernel(
 
     int kphysical_block_number[TLOOP];
 
-    // fetch k physical block numbers and K cache
-    // fetch k physical block numbers and K cache -- K cache related variables
-    constexpr bool NT_KV_LOAD = false;
-    constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
-    const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
-    const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD; 
-    int curr = 0, next = 1;
-    _B16x8 Kbuffer[2][HEAD_LOOP][QKHELOOP]; // curr and next K buffer
-
-    // fetch k physical block numbers and K cache -- define lambda: loading K cache
-    constexpr int n_global_load_per_fragment = HEAD_LOOP*QKHELOOP;
-    auto load_K_fragment = [&] __device__ (const cache_t* k_ptr3, int buf_idx) {
-        for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
-            for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) { // 4
-                const int head_elem = row_head_elem + qkhe_depth * QKHE_PER_FETCH
-                                    + head_loop * HEAD_SIZE_PER_LOOP;
-                const int offset1             = head_elem / KX;
-                const int offset2             = head_elem % KX;
-                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
-                const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
-
-                if constexpr (NT_KV_LOAD)
-                    Kbuffer[buf_idx][head_loop][qkhe_depth] = load_ntmprl_16Byte(k_fetch_ptr_16B);
-                else
-                    Kbuffer[buf_idx][head_loop][qkhe_depth] = *k_fetch_ptr_16B;
-            }
-        }
-    };
-
-    // fetch k physical block numbers and K cache -- Load K block and only load the first K block cache
+    // fetch k physical block numbers
     for(int token_depth = 0; token_depth < TLOOP; token_depth++) // 4
     {
         const int klocal_token_idx  = TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
@@ -157,21 +128,9 @@ __inline__ __device__ void _paged_attention_kernel(
         //     printf("[HIP] [K block] threadIdx=%3d, token_depth=%3d,  kblock_idx=%3d\n",
         //         threadIdx.x, token_depth, kblock_idx); 
         // }
-        
-        // [Double Buffer] Preload the first K cache for tha later QK mfma
-        if(token_depth==0){
-            // VMEM read -- for the first K block
-            __builtin_amdgcn_sched_group_barrier(0x0020, 1, 0);    
 
-            const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[0]);
-            const cache_t* k_ptr2       = k_ptr + kblock_number * kv_block_stride;
-            const int klocal_token_idx  = TOKENS_PER_WARP * warpid + 0 * 16 + lane16id;
-            const int kphysical_block_offset = klocal_token_idx % BLOCK_SIZE;
-            const cache_t* k_ptr3_init       = k_ptr2 + kphysical_block_offset * kv_seq_stride;
-            load_K_fragment(k_ptr3_init, 0);
-            // VMEM read -- load_K_fragment has QKHELOOP=4 VMEM, let first QKHELOOP execute first 
-            __builtin_amdgcn_sched_group_barrier(0x0020, 1, 0);     
-        }
+        // Note: when token_depth=0, do not use load_K_fragment(_, 0) 
+        //       as it needs to wait for global_load kphysical_block_number[0]
     }
 
     // fetch Q in shared across warps and then write to registers
@@ -244,9 +203,60 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
     __syncthreads();
+    
 
 
-    // calculate post qk mfma scale
+    // qk mfma
+    // qk mfma - K related variables
+    DEBUG_MARKER("qk mfma");    
+    // qk mfma - K cache related variables
+    constexpr bool NT_KV_LOAD = false;
+    constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
+    const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
+    const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD; 
+    int curr = 0, next = 1;
+    _B16x8 Kbuffer[2][HEAD_LOOP][QKHELOOP]; // curr and next K buffer
+
+    // qk mfma - define lambda: loading K cache
+    constexpr int n_global_load_per_fragment = HEAD_LOOP*QKHELOOP;
+    auto load_K_fragment = [&] __device__ (const cache_t* k_ptr3, int buf_idx) {
+        for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
+            for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) { // 4
+                const int head_elem = row_head_elem + qkhe_depth * QKHE_PER_FETCH
+                                    + head_loop * HEAD_SIZE_PER_LOOP;
+                const int offset1             = head_elem / KX;
+                const int offset2             = head_elem % KX;
+                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
+                const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
+
+                if constexpr (NT_KV_LOAD)
+                    Kbuffer[buf_idx][head_loop][qkhe_depth] = load_ntmprl_16Byte(k_fetch_ptr_16B);
+                else
+                    Kbuffer[buf_idx][head_loop][qkhe_depth] = *k_fetch_ptr_16B;
+            }
+        }
+    };
+    
+    // qk mfma - Preload the kphysical_block_number[0] cache
+    const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[0]);
+    const cache_t* k_ptr2       = k_ptr + kblock_number * kv_block_stride;
+    const int klocal_token_idx  = TOKENS_PER_WARP * warpid + 0 * 16 + lane16id;
+    const int kphysical_block_offset = klocal_token_idx % BLOCK_SIZE;
+    const cache_t* k_ptr3_init       = k_ptr2 + kphysical_block_offset * kv_seq_stride;
+    load_K_fragment(k_ptr3_init, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0020, n_global_load_per_fragment, 0);     // VMEM read
+
+    // qk mfma - Setup alibi_slope
+    float alibi_slope[GQA_RATIO_LOOP];
+    if constexpr(ALIBI_ENABLED)
+    {
+        for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
+            const int alibi_head_idx = wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
+            alibi_slope[gqa_ratio_loop] = (lane16id < GQA_RATIO_PER_LOOP) ? alibi_slopes[alibi_head_idx] : 0.f;
+        }
+    }
+
+    // qk mfma - calculate post qk mfma scale
     float scale2 = scale;
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
@@ -266,12 +276,7 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }();
 
-    
-
-
-    // qk mfma
-    // qk mfma - K related variables
-    DEBUG_MARKER("qk mfma");    
+    // qk mfma - load K cache[iter+1] + mfma[iter]
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) { // 4
         // Preload the next K cache
@@ -346,6 +351,16 @@ __inline__ __device__ void _paged_attention_kernel(
                 for (int i = 0; i < 4; i++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = variant->QueryTransform(variant_params, d_out[gqa_ratio_loop][mtp][token_depth][i]);
+                    if constexpr (ALIBI_ENABLED) {
+                        d_out[gqa_ratio_loop][mtp][token_depth][i] += alibi_slope[gqa_ratio_loop] * (alibi_offset + i);
+                    }
+                    // apply soft-capping to logits
+                    d_out[gqa_ratio_loop][mtp][token_depth][i] =
+                        variant->LogitsTransform(variant_params,
+                                                d_out[gqa_ratio_loop][mtp][token_depth][i],
+                                                /*batch_idx=*/query_start_off + mtp * MTP_PARALLEL_THREADS,
+                                                /*qo_head_idx=*/wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP,
+                                                /*kv_head_idx=*/kv_head_idx);
                 }     
             }
         }
@@ -355,48 +370,6 @@ __inline__ __device__ void _paged_attention_kernel(
     }
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
 
-    // Seg 5
-    DEBUG_MARKER("Seg 5");
-    // apply alibi
-    float alibi_slope[GQA_RATIO_LOOP];
-    if constexpr(ALIBI_ENABLED)
-    {
-        for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-            const int alibi_head_idx = wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
-            alibi_slope[gqa_ratio_loop] = (lane16id < GQA_RATIO_PER_LOOP) ? alibi_slopes[alibi_head_idx] : 0.f;
-        }
-    }
-
-    if constexpr (ALIBI_ENABLED) {
-        for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
-            const int local_token_idx = qkout_token_idx + token_depth * 16;
-            const int alibi_offset = local_token_idx - context_len + 1;
-            for (int mtp = 0; mtp < mtp_loop; mtp++) {
-                for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-                    for (int i = 0; i < 4; i++) {
-                        d_out[gqa_ratio_loop][mtp][token_depth][i] += alibi_slope[gqa_ratio_loop] * (alibi_offset + i);
-                    }
-                }
-            }
-        }
-    }
-    // apply soft-capping to logits
-    for (int token_depth = 0; token_depth < TLOOP; token_depth++)
-    {
-        for (int mtp = 0; mtp < mtp_loop; mtp++) {
-            for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-                for (int i = 0; i < 4; i++) {
-                    d_out[gqa_ratio_loop][mtp][token_depth][i] =
-                        variant->LogitsTransform(variant_params,
-                                                d_out[gqa_ratio_loop][mtp][token_depth][i],
-                                                /*batch_idx=*/query_start_off + mtp * MTP_PARALLEL_THREADS,
-                                                /*qo_head_idx=*/wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP,
-                                                /*kv_head_idx=*/kv_head_idx);
-                }
-                
-            }
-        }
-    }
 
     // calculate qk_max and exp_sum per warp and write to shared memory
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
