@@ -277,7 +277,8 @@ __inline__ __device__ void _paged_attention_kernel(
     }();
 
     // qk mfma - load K cache[iter+1] + mfma[iter]
-    floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
+    floatx4 d_out[GQA_RATIO_LOOP][mtp_loop][TLOOP];
+    const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) { // 4
         // Preload the next K cache
         if (token_depth + 1 < TLOOP){
@@ -290,6 +291,10 @@ __inline__ __device__ void _paged_attention_kernel(
             load_K_fragment(k_ptr3_next, next);
             __builtin_amdgcn_sched_group_barrier(0x0020, n_global_load_per_fragment, 0);     // VMEM read
         }
+
+        // ALIBI
+        const int local_token_idx = qkout_token_idx + token_depth * 16;
+        const int alibi_offset = local_token_idx - context_len + 1;
 
         for (int mtp = 0; mtp < mtp_loop; mtp++) { // 1      
             for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) { // 1
@@ -357,10 +362,10 @@ __inline__ __device__ void _paged_attention_kernel(
                     // apply soft-capping to logits
                     d_out[gqa_ratio_loop][mtp][token_depth][i] =
                         variant->LogitsTransform(variant_params,
-                                                d_out[gqa_ratio_loop][mtp][token_depth][i],
-                                                /*batch_idx=*/query_start_off + mtp * MTP_PARALLEL_THREADS,
-                                                /*qo_head_idx=*/wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP,
-                                                /*kv_head_idx=*/kv_head_idx);
+                            d_out[gqa_ratio_loop][mtp][token_depth][i],
+                            /*batch_idx=*/query_start_off + mtp * MTP_PARALLEL_THREADS,
+                            /*qo_head_idx=*/wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP,
+                            /*kv_head_idx=*/kv_head_idx);
                 }     
             }
         }
@@ -368,12 +373,12 @@ __inline__ __device__ void _paged_attention_kernel(
         curr = next;
         next = tmp;
     }
-    const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
+    
 
 
     // calculate qk_max and exp_sum per warp and write to shared memory
-    float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
-    float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
+    float qk_max[GQA_RATIO_LOOP][mtp_loop] = {-FLT_MAX};
+    float exp_sum[GQA_RATIO_LOOP][mtp_loop] = {0.0f};
 
     for (int mtp = 0; mtp < mtp_loop; mtp++) {
         for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
