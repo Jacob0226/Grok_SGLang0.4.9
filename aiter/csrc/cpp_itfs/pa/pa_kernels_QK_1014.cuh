@@ -132,6 +132,7 @@ __inline__ __device__ void _paged_attention_kernel(
         // Note: when token_depth=0, do not use load_K_fragment(_, 0) 
         //       as it needs to wait for global_load kphysical_block_number[0]
     }
+    __builtin_amdgcn_sched_group_barrier(0x0020, TLOOP, 0);     // VMEM read
 
     // fetch Q in shared across warps and then write to registers
     const int warp_mtp_idx = warpid / (4 / MTP_PARALLEL_THREADS); // Jacob: MTP_PARALLEL_THREADS=1, warpid=0, warp_mtp_idx=0
@@ -210,7 +211,7 @@ __inline__ __device__ void _paged_attention_kernel(
     // qk mfma - K related variables
     DEBUG_MARKER("qk mfma");    
     // qk mfma - K cache related variables
-    constexpr bool NT_KV_LOAD = false;
+    constexpr bool NT_KV_LOAD = true;
     constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD; 
@@ -276,9 +277,11 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }();
 
-    // qk mfma - load K cache[iter+1] + mfma[iter]
+    // qk mfma - load K cache[iter+1] + mfma[iter] + softmax_phase1
     floatx4 d_out[GQA_RATIO_LOOP][mtp_loop][TLOOP];
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
+    float qk_max[GQA_RATIO_LOOP][mtp_loop] = {-FLT_MAX};
+    float exp_sum[GQA_RATIO_LOOP][mtp_loop] = {0.0f};
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) { // 4
         // Preload the next K cache
         if (token_depth + 1 < TLOOP){
@@ -366,6 +369,14 @@ __inline__ __device__ void _paged_attention_kernel(
                             /*batch_idx=*/query_start_off + mtp * MTP_PARALLEL_THREADS,
                             /*qo_head_idx=*/wg_start_head_idx + lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP,
                             /*kv_head_idx=*/kv_head_idx);
+                    
+
+                    // Softmax phase 1 (phase 2 is in reduce kernel)
+                    // Step 1. Get max qk per thread: 
+                    const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
+                                            ? d_out[gqa_ratio_loop][mtp][token_depth][i]
+                                            : -FLT_MAX;
+                    qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], tmp);
                 }     
             }
         }
@@ -376,26 +387,34 @@ __inline__ __device__ void _paged_attention_kernel(
     
 
 
-    // calculate qk_max and exp_sum per warp and write to shared memory
-    float qk_max[GQA_RATIO_LOOP][mtp_loop] = {-FLT_MAX};
-    float exp_sum[GQA_RATIO_LOOP][mtp_loop] = {0.0f};
+    
 
     for (int mtp = 0; mtp < mtp_loop; mtp++) {
         for (int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++) {
-            for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
-                const int local_token_idx = qkout_token_idx + token_depth * 16;
-                for (int i = 0; i < 4; i++) {
-                    const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
-                                            ? d_out[gqa_ratio_loop][mtp][token_depth][i]
-                                            : -FLT_MAX;
-                    qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], tmp);
-                }
-            }
+            // Step 1. Get max qk per thread: 
+            //     Each thread process 4 tokens in the TLOOP. For each token, each thread stores 4 elements
+            //     Take thread 1 for example, float4
+            //     token 1: 1.x 1.y 1.z 1.w   --> get max value
+            //     token 2: 2.x 2.y 2.z 2.w   --> get max value
+            // for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+            //     const int local_token_idx = qkout_token_idx + token_depth * 16;
+            //     for (int i = 0; i < 4; i++) {
+            //         const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
+            //                                 ? d_out[gqa_ratio_loop][mtp][token_depth][i]
+            //                                 : -FLT_MAX;
+            //         qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], tmp);
+            //     }
+            // }
             
+            // Step 2. Get max qk per wavefronts
+            //    According to ROCm CDNA4 mfma16x16x32, The output dim of mfma(qk) is 16x16.
+            //    Thread [1, 17, 33, 49] stores 1 column, 16 elements of mfma(K@Q.T). 
+            //    Use the following loop can get the max(thread1, thread17, thread33, thread49)
             for (int mask = WARP_SIZE / 2; mask >= 16; mask /= 2) {
                 qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], __shfl_xor(qk_max[gqa_ratio_loop][mtp], mask));
             }
 
+            // Step 3. exp(qk-qk_max)
             for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
                 for (int i = 0; i < 4; i++) {
@@ -412,8 +431,8 @@ __inline__ __device__ void _paged_attention_kernel(
             }
         }   
     }
-    __syncthreads(); // sync before writing to shared mem
-
+    // __syncthreads(); // sync before writing to shared mem  // Why need sync here? no LDS ops before this line
+ 
     // Seg 6
     // Seg 6.1
     DEBUG_MARKER("Seg 6.1");
@@ -433,6 +452,7 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 6.2
     DEBUG_MARKER("Seg 6.2");
+    // DEBUG: Get qk_max across wavefronts
     // calculate partition qk_max and exp_sum
     float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
     float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD] = {-FLT_MAX};
@@ -484,6 +504,7 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // Seg 7.2
     DEBUG_MARKER("Seg 7.2");
+    // DEBUG: Get qk_max across blocks 
     // write out partition max_logits and exp_sum
     if (threadIdx.x < GQA_RATIO_MTP_PARALLEL) {
         for(int mtp = 0; mtp < mtp_loop; mtp++) {
@@ -561,8 +582,16 @@ __inline__ __device__ void _paged_attention_kernel(
                     static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
                 const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
 
-                Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
-                    *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                // Jacob: Non temporal load for large batch size
+                const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                if constexpr(NT_KV_LOAD)
+                {
+                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] = load_ntmprl_16Byte(v_fetch_ptr_16B);
+                }
+                else{
+                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
+                        *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                }
             }
         }
     }
