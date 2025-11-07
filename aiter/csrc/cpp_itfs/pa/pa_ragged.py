@@ -39,6 +39,8 @@ def compile(
     #     f"  mtp={mtp}\n"
     #     f"  logits_soft_cap_enabled={logits_soft_cap_enabled}\n"
     #     f"  func_name={func_name}\n")
+    import os
+    version = os.getenv('QKV_VERSION', 'GOLDEN')
 
     return compile_template_op(
         src_template,
@@ -64,6 +66,8 @@ def compile(
         alibi_enabled=alibi_enabled,
         logits_soft_cap_enabled=logits_soft_cap_enabled,
         func_name=func_name,
+        # choice: [GOLDEN, JACOB]. Classify original kernel and experimental kernel
+        version=version,
     )
 
 
@@ -149,15 +153,31 @@ def paged_attention_ragged(
     num_heads = query.size(1)
     head_size = query.size(2)
     q_stride = query.stride(0)
-    kv_block_stride = key_cache.stride(0)
+    kv_block_stride = key_cache.stride(0) # key_cache: [nThreBlock, nHead, block_size, head_dim]
     kv_head_stride = (
         key_cache.stride(1) if kv_cache_layout == "HND" else key_cache.stride(2)
     )
     kv_seq_stride = (
         key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     )
+    # print(f"[DEBUG] kv_block_stride={kv_block_stride}, kv_head_stride={kv_head_stride}, " 
+    #       f"kv_seq_stride={kv_seq_stride}, q_stride={q_stride}, "
+    #       f"kv_cache_layout={kv_cache_layout}, key_cache.shape={key_cache.shape}, "
+    #       f"block_size={block_size}")
+    
+    # Print K cache
+    # data_slice = key_cache[14555][0][0][0:128]
+    # formatted_elements = [f"{x.item():.6f}" for x in data_slice]
+    # ELEMENTS_PER_ROW = 8
+    # total_elements = len(formatted_elements)
+    # print(f"[DEBUG] key_cache[14555][0][0][0:{total_elements}]=")
+    # for i in range(0, total_elements, ELEMENTS_PER_ROW):
+    #     row_slice = formatted_elements[i : i + ELEMENTS_PER_ROW]
+    #     print(f"Thread [{i//ELEMENTS_PER_ROW:2d}] " + '  '.join(row_slice))
+
     gqa_ratio = int(num_heads / num_kv_heads)
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    # print(f"[DEBUG] max_num_partitions={max_num_partitions}, warpSize={warpSize}")
     func = compile(
         gqa_ratio,
         head_size,

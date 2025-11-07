@@ -10,6 +10,7 @@ from aiter import dtypes
 from enum import Enum
 from einops import rearrange
 import argparse
+import os
 
 uniform_range = (-1, 1)
 class PAVariant(Enum):
@@ -86,7 +87,7 @@ def kv_cache_factory(
     return key_caches, value_caches
 
 def run_aiter(
-    query,
+    query,      # [bs=512, qhead=6, head_dim=128]
     key_cache,
     value_cache,
     kv_indptr,
@@ -101,7 +102,9 @@ def run_aiter(
     logits_soft_cap,
     k_scale,
     v_scale,
+    version="GOLDEN",
 ):
+    os.environ['QKV_VERSION'] = version
     # copied from ops.PagedAttention.forward_decode()
     _PARTITION_SIZE_ROCM = 256
     fp8_out_scale = None
@@ -127,10 +130,6 @@ def run_aiter(
         dtype=torch.uint8,
         device=output.device,
     )
-    print(f"[DEBUG] num_seqs={num_seqs}, num_heads={num_heads}, "
-                f"max_num_partitions={max_num_partitions}, head_size={head_size}, "
-                f"nbyes_per_qo_elem={nbyes_per_qo_elem}, "
-                f"_PARTITION_SIZE_ROCM={_PARTITION_SIZE_ROCM}, output.dtype={output.dtype}")
 
     cpa_fp8_out = False
     if fp8_out_scale is not None:
@@ -157,10 +156,13 @@ def run_aiter(
         fp8_out_scale if cpa_fp8_out else None,
         _PARTITION_SIZE_ROCM,
     )
+
     if cpa_fp8_out:
-        return output.view(num_seqs, num_heads * head_size)
+        return workspace_buffer, output.view(num_seqs, num_heads * head_size)
     else:
-        return output
+        return workspace_buffer, output
+    
+        
 
 def test_paged_attention(
     ctx_lens: int,
@@ -177,6 +179,7 @@ def test_paged_attention(
     quant_cache_dtype: torch.dtype,
     seed: int,
     device: str,
+    warmup_iter: int,
 ) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
@@ -256,10 +259,15 @@ def test_paged_attention(
 
         return block_tables[col_indices < elements_per_row.unsqueeze(1)]
 
+    # If ctx_lens=2048, block_size=16, kv_indptr=[0, 128, 256, 384, ...]
+    # block_tables: [nSeq, max_num_blocks_per_seq]
     kv_indptr, kv_last_page_lens = convert_to_kv_indptr_last_page_lens(ctx_lens)
     kv_page_indices = convert_to_page_indices(block_tables, kv_indptr)
+    # print(f"kv_page_indices.shape={kv_page_indices.shape}, {kv_page_indices}")
+    # print(f"block_tables.shape={block_tables.shape}, {block_tables}")
+    
 
-    # generate golden output
+    # generate golden output. from shape (num_blocks, num_heads, head_size // x, block_size, x)
     key_cache_new = rearrange(key_cache, "b h d1 s d2 -> b h s (d1 d2)")
     value_cache_new = rearrange(value_cache, "b h d s -> b h s d")
 
@@ -267,27 +275,7 @@ def test_paged_attention(
         key_cache_new = rearrange(key_cache_new, "b h s d -> b s h d")
         value_cache_new = rearrange(value_cache_new, "b h s d -> b s h d")
 
-    # Warmup 5 iter
-    for i in range(5):
-        _ = run_aiter(
-            query,
-            key_cache_new.contiguous(),
-            value_cache_new.contiguous(),
-            kv_indptr,
-            kv_page_indices,
-            kv_last_page_lens,
-            max_seq_len,
-            kv_cache_dtype,
-            kv_cache_layout,
-            num_kv_heads,
-            scale,
-            alibi_slopes,
-            logits_soft_cap,
-            k_scale,
-            v_scale,
-        )
-
-    out_golden = run_aiter(
+    ARGS_TUPLE = (
         query,
         key_cache_new.contiguous(),
         value_cache_new.contiguous(),
@@ -305,6 +293,83 @@ def test_paged_attention(
         v_scale,
     )
 
+    
+    # Warmup
+    for i in range(warmup_iter):
+        _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
+        _, _ = run_aiter(*ARGS_TUPLE, version='JACOB')
+    workspace_golden, out_golden = run_aiter(*ARGS_TUPLE, version='GOLDEN')
+    workspace_jacob, out_jacob = run_aiter(*ARGS_TUPLE, version='JACOB')
+
+    # Grok1-bf16-TP8 + bs512-ilen2048: 
+    #    num_seqs=512, num_heads=6, max_num_partitions=8, head_size=128, nbyes_per_qo_elem=2
+    
+    # workspace_buffer size: from pa_ragged.cpp.jinja
+    #     exp_sums_ptr:  = (num_seqs * num_heads * max_num_partitions) * 4 as type is float
+    #                    = 512*6*8*4 bytes
+    #     max_logits_ptr:= (num_seqs * num_heads * max_num_partitions) * 4 as type is float
+    #                    = 512*6*8*4 bytes
+    #     tmp_out_ptr:   = (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
+    #                    = 512*6*8*128*2 bytes
+    # output size = torch.empty_like(query), dtype=dtype
+    num_seqs, num_heads, head_size = query.shape
+    block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
+    _PARTITION_SIZE_ROCM = 256
+    max_num_partitions = (
+            max_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
+    nbyes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+    bytes_sizes = [num_seqs * num_heads * max_num_partitions * 4, 
+                   num_seqs * num_heads * max_num_partitions * 4, 
+                   num_seqs * num_heads * max_num_partitions * head_size * nbyes_per_qo_elem]
+    print(f"[DEBUG] num_seqs={num_seqs}, num_heads={num_heads}, block_size={block_size}, "
+                f"max_num_partitions={max_num_partitions}, head_size={head_size}, "
+                f"nbyes_per_qo_elem={nbyes_per_qo_elem}, "
+                f"_PARTITION_SIZE_ROCM={_PARTITION_SIZE_ROCM}")
+    
+    target_dtypes = [torch.float, torch.float, torch.bfloat16]
+    import itertools
+    accu_bytes = list(itertools.accumulate(bytes_sizes, initial=0))
+    def split_workspace(workspace):
+        blocks = []
+        for i in range(len(bytes_sizes)):
+            start_byte_idx = accu_bytes[i]
+            end_byte_idx = accu_bytes[i+1]
+            byte_slice = workspace[start_byte_idx:end_byte_idx]
+            block = byte_slice.view(target_dtypes[i])
+            blocks.append(block)
+        return blocks
+    
+    # 定义用于 allclose 的容忍度
+    def NumericCheck(
+        golden_tensor: torch.Tensor,
+        jacob_tensor: torch.Tensor,
+        name: str = "Tensor",
+        rtol: float = 1e-5,
+        atol: float = 1e-8,
+        max_display: int = 5):
+
+        mismatch_mask = torch.abs(golden_tensor - jacob_tensor) > (atol + rtol * torch.abs(jacob_tensor))
+        mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
+        mismatch_count = mismatch_mask.sum().item()
+        if mismatch_count > 0:
+            num_to_display = min(10, mismatch_count)
+            print(f"Numeric Check [{name} Failed] Elem count: {exp_sums_golden.numel()}, mismatch_count = {mismatch_count}")
+            for i in range(num_to_display):
+                idx = mismatch_indices[i].item()
+                golden_val = exp_sums_golden[idx].item()
+                jacob_val = exp_sums_jacob[idx].item()
+                abs_diff = abs(golden_val - jacob_val)
+                print(f"  Index [{idx}]: Golden={golden_val:.6e}, Jacob={jacob_val:.6e}, Abs Diff={abs_diff:.2e}")
+        else:
+            print(f"Numeric Check [{name} Success]")
+
+    exp_sums_golden, max_logits_golden, tmp_out_golden = split_workspace(workspace_golden)
+    exp_sums_jacob, max_logits_jacob, tmp_out_jacob = split_workspace(workspace_jacob)
+    NumericCheck(exp_sums_golden, exp_sums_jacob, "exp_sums")
+    NumericCheck(max_logits_golden, max_logits_jacob, "max_logits")
+    NumericCheck(tmp_out_golden, tmp_out_jacob, "tmp_out")
+    NumericCheck(out_golden, out_jacob, "out")
 
 
 if __name__ == "__main__":
@@ -345,6 +410,18 @@ if __name__ == "__main__":
         default=512,
         help="number of seqs",
     )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=16,
+        help="block size(page size)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+        help="warmup iterations",
+    )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
     args.quant_cache_dtype = [
@@ -354,24 +431,28 @@ if __name__ == "__main__":
     ctx_len = args.ctx_len
     pa_variant = args.pa_variant
     quant_cache_dtype = args.quant_cache_dtype
-    print(f"[DEBUG pa_unit_test.py] ctx_len={ctx_len}, pa_variant={pa_variant}, quant_cache_dtype={quant_cache_dtype}")
+    # print(f"[DEBUG pa_unit_test.py] ctx_len={ctx_len}, pa_variant={pa_variant}, quant_cache_dtype={quant_cache_dtype}")
 
+    block_size = args.page_size # Original block size is 1
     test_paged_attention(
         ctx_len, 
         args.n,
-        (6, 1),   # num_heads: query and KV
-        128,      # head_size
-        False,    # use_alibi
-        1,        # block_size
+        (6, 1),      # num_heads: query and KV
+        128,         # head_size
+        False,       # use_alibi
+        block_size,  # block_size
         dtypes.bf16, # dtype
-        "auto",   # kv_cache_dtype
-        "HND",    # kv_cache_layout
-        30.0,      # logits_soft_cap
+        "auto",      # kv_cache_dtype
+        "HND",       # kv_cache_layout
+        30.0,        # logits_soft_cap
         pa_variant,
         quant_cache_dtype,
-        0,        # seed
-        "cuda:0", # device
+        0,           # seed
+        "cuda:0",    # device
+        args.warmup
     )
+    
+
 
 '''
 # Even if the input length is 256, I use "context length = 2048"
