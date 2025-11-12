@@ -69,7 +69,7 @@ void {{func_name}}(void* out_ptr,
     dim3 block(NTHR);
 
     constexpr int VERSION_ID = {{"0" if version == 'GOLDEN' else "1" if version == 'JACOB' else "0"}};
-    printf("[AITER DEBUG] Running QKV version: %s \n", "{{ version }}");
+    // printf("[AITER DEBUG] Running QKV version: %s \n", "{{ version }}");
     
     paged_attention_ll4mi_QKV_mfma16_kernel<VERSION_ID,
                                             {{dtype}},                       
