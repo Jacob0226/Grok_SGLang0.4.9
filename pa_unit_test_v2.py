@@ -11,6 +11,7 @@ from enum import Enum
 from einops import rearrange
 import argparse
 import os
+import numpy as np
 
 uniform_range = (-1, 1)
 class PAVariant(Enum):
@@ -43,9 +44,9 @@ def get_kv_cache_torch_dtype(
         raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
     return torch_dtype
 
-def kv_cache_factory(
+def kv_cache_factory_v2(
     num_blocks: int,
-    block_size: int,
+    page_size: int,
     num_layers: int,
     num_heads: int,
     head_size: int,
@@ -61,9 +62,7 @@ def kv_cache_factory(
         )
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
-
-    x = 16 // torch_dtype.itemsize
-    key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+    key_cache_shape = (num_blocks, 1, num_heads, head_size)
     key_caches: List[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
@@ -73,7 +72,7 @@ def kv_cache_factory(
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_cache)
 
-    value_cache_shape = (num_blocks, num_heads, head_size, block_size)
+    value_cache_shape = (num_blocks, 1, num_heads, head_size)
     value_caches: List[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
@@ -86,6 +85,46 @@ def kv_cache_factory(
         value_caches.append(value_cache)
     return key_caches, value_caches
 
+def kv_ptr_factory(
+        num_seqs: int,
+        ctx_lens: int,
+        page_size: int,
+    )-> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    # kv_indptr
+    num_blocks_list = [ctx_lens] * num_seqs
+    kv_indptr = torch.tensor([0] + num_blocks_list).cumsum(
+        dim=0, dtype=torch.int
+    )
+
+    # kv_page_indices
+    padded_ctx_lens = page_size * int(np.ceil(ctx_lens / page_size)) # e.g., ctx_lens=10, page_size=3 --> padded_ctx_lens=12
+    index_total = num_seqs * padded_ctx_lens
+    head_per_row = int(np.ceil(ctx_lens / page_size))
+    head_total = num_seqs * int(np.ceil(ctx_lens / page_size))
+
+    # Generate heads (Start from 0, page_size, 2xpage_size, ...)
+    all_heads = np.arange(0, index_total, page_size)
+    np.random.shuffle(all_heads)
+    row_chunks = all_heads.reshape(num_seqs, head_per_row)
+    
+    # Sort the chunks since the page indices are in ascending order.
+    sorted_row_heads = np.sort(row_chunks, axis=1)
+    extended_heads = np.repeat(sorted_row_heads, page_size, axis=1)
+    
+    # Create Offset matrix with shape (1, length)
+    offset = np.tile(np.arange(page_size), head_per_row)
+    print(sorted_row_heads.shape)
+    
+    # shape (bs, length)
+    offset_tile = np.tile(offset, (num_seqs, 1))
+    
+    # Extend sorted_row_heads 
+    
+    kv_page_indices = extended_heads + offset_tile
+    kv_page_indices = kv_page_indices[:, :ctx_lens]
+    kv_page_indices = torch.from_numpy(kv_page_indices).to(device='cuda:0', dtype=torch.int32)
+    return kv_indptr, kv_page_indices.reshape(-1)
+
 def run_aiter(
     query,      # [bs=512, qhead=6, head_dim=128]
     key_cache,
@@ -93,6 +132,7 @@ def run_aiter(
     kv_indptr,
     kv_page_indices,
     kv_last_page_lens,
+    page_size,
     max_seq_len,
     kv_cache_dtype,
     kv_cache_layout,
@@ -130,8 +170,6 @@ def run_aiter(
         dtype=torch.uint8,
         device=output.device,
     )
-    # print(f"[DEBUG] workspace_buffer.shape={workspace_buffer.shape}")
-
 
     cpa_fp8_out = False
     if fp8_out_scale is not None:
@@ -147,6 +185,7 @@ def run_aiter(
         kv_indptr,
         kv_page_indices,
         kv_last_page_lens,
+        # page_size,
         block_size,
         max_num_partitions,
         alibi_slopes,
@@ -172,7 +211,7 @@ def test_paged_attention(
     num_heads: Tuple[int, int],
     head_size: int,
     use_alibi: bool,
-    block_size: int,
+    page_size: int,
     dtype: torch.dtype,
     kv_cache_dtype: str,
     kv_cache_layout: str,
@@ -185,7 +224,8 @@ def test_paged_attention(
 ) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
-    torch.set_default_device(device)  
+    torch.set_default_device(device) 
+    block_size = 1
 
     # Using default kv_scale
     k_scale = v_scale = torch.tensor([1.0], dtype=dtypes.fp32)
@@ -207,9 +247,9 @@ def test_paged_attention(
     query.uniform_(*uniform_range)
 
     # Create the KV caches.
-    key_caches, value_caches = kv_cache_factory(
+    key_caches, value_caches = kv_cache_factory_v2(
         num_blocks,
-        block_size,
+        page_size,
         1,
         num_kv_heads,
         head_size,
@@ -218,83 +258,27 @@ def test_paged_attention(
         seed,
         device,
     )
-
     key_cache, value_cache = key_caches[0], value_caches[0]
-    # print(f"[DEBUG pa_unit_test.py] before, key_cache.shape={key_cache.shape}")
-    # print(f"[DEBUG pa_unit_test.py] before, value_cache.shape={value_cache.shape}")
-
-    # Create the block tables.
-    block_tables = rearrange(
-        torch.randperm(num_blocks, dtype=dtypes.i32, device=device),
-        "(b nblocks) -> b nblocks",
-        b=num_seqs,
-    )
-
-    # prepare flashinfer format-compatible parameters
-    # TODO: pass list of context_length instead
-    def convert_to_kv_indptr_last_page_lens(fixed_context_length):
-        def get_num_blocks(context_length):
-            return (context_length + block_size - 1) // (block_size)
-
-        def get_last_page_len(context_length):
-            return (
-                context_length % block_size
-                if context_length % block_size > 0
-                else block_size
-            )
-
-        context_lengths = [fixed_context_length] * num_seqs
-        num_blocks_list = [
-            get_num_blocks(context_length) for context_length in context_lengths
-        ]
-        last_page_lens = [
-            get_last_page_len(context_length) for context_length in context_lengths
-        ]
-
-        return torch.tensor([0] + num_blocks_list).cumsum(
-            dim=0, dtype=torch.int
-        ), torch.tensor(last_page_lens, dtype=torch.int)
-
-    def convert_to_page_indices(block_tables, kv_indptr):
-        elements_per_row = kv_indptr[1:] - kv_indptr[:-1]
-        col_indices = torch.arange(block_tables.size(1)).expand(
-            block_tables.size(0), -1
-        )
-
-        return block_tables[col_indices < elements_per_row.unsqueeze(1)]
-
-    # If ctx_lens=2048, block_size=16, kv_indptr=[0, 128, 256, 384, ...]
-    # block_tables: [nSeq, max_num_blocks_per_seq]
-    kv_indptr, kv_last_page_lens = convert_to_kv_indptr_last_page_lens(ctx_lens)
-    kv_page_indices = convert_to_page_indices(block_tables, kv_indptr)
-    # print(f"kv_page_indices.shape={kv_page_indices.shape}, {kv_page_indices}")
-    # print(f"block_tables.shape={block_tables.shape}, {block_tables}")
-    
-
-    # generate golden output. from shape (num_blocks, num_heads, head_size // x, block_size, x)
-    key_cache_new = rearrange(key_cache, "b h d1 s d2 -> b h s (d1 d2)")
-    value_cache_new = rearrange(value_cache, "b h d s -> b h s d")
-    # print(f"[DEBUG pa_unit_test.py] after, key_cache_new.shape={key_cache_new.shape}")
-    # print(f"[DEBUG pa_unit_test.py] after, value_cache_new.shape={value_cache_new.shape}")
-    # print(f"[DEBUG pa_unit_test.py] value_cache.is_contiguous()={value_cache.is_contiguous()}, value_cache_new.is_contiguous()={value_cache_new.is_contiguous()}")
-
-    if kv_cache_layout == "NHD":
-        key_cache_new = rearrange(key_cache_new, "b h s d -> b s h d")
-        value_cache_new = rearrange(value_cache_new, "b h s d -> b s h d")
-    # print(f"[DEBUG pa_unit_test.py] Arrange value_cache_new.is_contiguous()={value_cache_new.is_contiguous()}")
-
-    # print(f"[DEBUG] key_cache_new.shape={key_cache_new.shape}, value_cache_new.shape={value_cache_new.shape}")
-    # print(f"[DEBUG] kv_indptr.shape={kv_indptr.shape}, kv_page_indices.shape={kv_page_indices.shape}, kv_last_page_lens.shape={kv_last_page_lens.shape}")
+    kv_indptr, kv_page_indices = kv_ptr_factory(num_seqs, ctx_lens, page_size)
+    kv_last_page_lens = torch.tensor([block_size for i in range(num_seqs)], dtype=torch.int)
+    # print(f"[DEBUG pa_unit_test.py]  value_cache.is_contiguous()={value_cache.is_contiguous()}")
+    print(f"[DEBUG] kv_indptr.shape={kv_indptr.shape}, kv_page_indices.shape={kv_page_indices.shape}, kv_last_page_lens.shape={kv_last_page_lens.shape}")
+    print(f"[DEBUG] key_cache.shape={key_cache.shape}, value_cache.shape={value_cache.shape}")
     print(f"[DEBUG] kv_page_indices={kv_page_indices}")
+    # print(f"[DEBUG] kv_page_indices.max()={kv_page_indices.max()}, num_seqs*ctx_lens={num_seqs*ctx_lens}")
+    # kv_page_indices[:] = 1
+    # exit(0)
     # print(f"[DEBUG] kv_last_page_lens={kv_last_page_lens}")
-    # print(f"max(kv_page_indices)={max(kv_page_indices)}")
+    # print(f"kv_indptr={kv_indptr}")
+    
     ARGS_TUPLE = (
         query,
-        key_cache_new.contiguous(),
-        value_cache_new.contiguous(),
+        key_cache.contiguous(),
+        value_cache.contiguous(),
         kv_indptr,
         kv_page_indices,
         kv_last_page_lens,
+        page_size,
         max_seq_len,
         kv_cache_dtype,
         kv_cache_layout,
@@ -335,10 +319,10 @@ def test_paged_attention(
     bytes_sizes = [num_seqs * num_heads * max_num_partitions * 4, 
                    num_seqs * num_heads * max_num_partitions * 4, 
                    num_seqs * num_heads * max_num_partitions * head_size * nbyes_per_qo_elem]
-    print(f"[DEBUG] num_seqs={num_seqs}, num_heads={num_heads}, block_size={block_size}, "
-                f"max_num_partitions={max_num_partitions}, head_size={head_size}, "
-                f"nbyes_per_qo_elem={nbyes_per_qo_elem}, "
-                f"_PARTITION_SIZE_ROCM={_PARTITION_SIZE_ROCM}")
+    # print(f"[DEBUG] num_seqs={num_seqs}, num_heads={num_heads}, block_size={block_size}, "
+    #             f"max_num_partitions={max_num_partitions}, head_size={head_size}, "
+    #             f"nbyes_per_qo_elem={nbyes_per_qo_elem}, "
+    #             f"_PARTITION_SIZE_ROCM={_PARTITION_SIZE_ROCM}")
     
     target_dtypes = [torch.float, torch.float, torch.bfloat16]
     import itertools
@@ -446,17 +430,17 @@ if __name__ == "__main__":
     quant_cache_dtype = args.quant_cache_dtype
     # print(f"[DEBUG pa_unit_test.py] ctx_len={ctx_len}, pa_variant={pa_variant}, quant_cache_dtype={quant_cache_dtype}")
 
-    block_size = args.page_size # Original block size is 1
+    page_size = args.page_size # Original block size is 1
     test_paged_attention(
         ctx_len, 
         args.n,
         (6, 1),      # num_heads: query and KV
         128,         # head_size
         False,       # use_alibi
-        block_size,  # block_size
+        page_size,
         dtypes.bf16, # dtype
         "auto",      # kv_cache_dtype
-        "HND",       # kv_cache_layout
+        "NHD",       # kv_cache_layout
         30.0,        # logits_soft_cap
         pa_variant,
         quant_cache_dtype,
@@ -471,7 +455,7 @@ if __name__ == "__main__":
 # Even if the input length is 256, I use "context length = 2048"
 # since I would like to know the performance of the kernel when 
 # the KV cache is longer than prefill 256 tokens.
-python pa_unit_test.py -n 512 -c 2048
+python ~/Grok_SGLang0.4.9/pa_unit_test_v2.py -n 512 -c 2048 --page-size 1 --warmup 0
 
 # E2E
 RCCL_MSCCL_ENABLE=0 SGLANG_USE_AITER=1 SGLANG_INT4_WEIGHT=1  python -m sglang.bench_one_batch \
