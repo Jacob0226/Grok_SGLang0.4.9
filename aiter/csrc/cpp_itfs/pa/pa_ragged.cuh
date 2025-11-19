@@ -32,6 +32,7 @@ template <int VERSION_ID,
           typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
+          int PAGE_SIZE,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -100,7 +101,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
     else // 1: JACOB VERSION
     {
-        _paged_attention_kernel_Jacob<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant>
+        _paged_attention_kernel_Jacob<scalar_t, cache_t, KV_DTYPE, PAGE_SIZE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant>
         (block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, k_scale_ptr, v_scale_ptr, variant);
     }
     
@@ -153,6 +154,7 @@ template <int VERSION_ID,
           typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
+          int PAGE_SIZE,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,

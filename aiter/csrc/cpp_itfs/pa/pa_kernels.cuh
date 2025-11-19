@@ -235,7 +235,7 @@ __inline__ __device__ void _paged_attention_kernel(
     DEBUG_MARKER("Seg 3")
     // set to true to enable non temporal kv loads: has some benefit in very high
     // batch size cases
-    constexpr bool NT_KV_LOAD = true;
+    constexpr bool NT_KV_LOAD = false;
 
     constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
@@ -1167,6 +1167,7 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
+          int PAGE_SIZE,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -1281,8 +1282,9 @@ __inline__ __device__ void _paged_attention_kernel_Jacob(
     // 4 TLOOP iteration load 64 tokens. Then, let each wavefront process 16 tokens mfma
     const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
     const int last_ctx_block     = num_context_blocks - 1;
+    const int last_ctx_page      = PAGE_SIZE * ((num_context_blocks - 1) / PAGE_SIZE); // PAGE_SIZE * floor((num_context_blocks - 1) / PAGE_SIZE)
 
-    int kphysical_block_number[TLOOP][ITERS_16TK];
+    int kphysical_page_number[TLOOP][ITERS_16TK];
     int kphysical_offset[TLOOP][ITERS_16TK];
     // fetch k physical block numbers
     // Jacob: loading order--> Token [0~16, 64~80, 128~144, 192~208], [16~32, 80~96, 144~160, 208~224]...
@@ -1297,15 +1299,21 @@ __inline__ __device__ void _paged_attention_kernel_Jacob(
             const int kglobal_token_idx = partition_start_token_idx + warp_token_offset + thread_token_offset;
             const int kblock_idx =
                 (kglobal_token_idx < context_len) ? kglobal_token_idx / BLOCK_SIZE : last_ctx_block;
+            const int kpage_idx =
+                (kglobal_token_idx < context_len) ? PAGE_SIZE * (kglobal_token_idx / BLOCK_SIZE / PAGE_SIZE) : last_ctx_block;
             const int kblock_offset = // % BLOCK_SIZE --> & (BLOCK_SIZE - 1)
-                (kglobal_token_idx < context_len) ? kglobal_token_idx & (BLOCK_SIZE - 1) : last_ctx_block;
-            kphysical_block_number[token_depth][iter_16tk] = block_table_seq[kblock_idx];
-            kphysical_offset[token_depth][iter_16tk] = kblock_offset;
-            
+                kglobal_token_idx & (BLOCK_SIZE - 1);
+            const int kpage_offset = kglobal_token_idx - kpage_idx; // Suppose BLOCK_SIZE=1
+            kphysical_page_number[token_depth][iter_16tk] = block_table_seq[kpage_idx];
+            kphysical_offset[token_depth][iter_16tk] = kpage_offset;
        
-            // if (threadIdx.x < 16 && token_depth==0 && iter_16tk==0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            //     printf("[HIP] [K block] threadIdx=%3d, iter_16tk=%d, block idx=%3d,  kblock_offset=%3d, BLOCK_SIZE=%d\n",
-            //         threadIdx.x, iter_16tk, block_table_seq[kblock_idx], kblock_offset, BLOCK_SIZE); 
+            // if (threadIdx.x %16==0 && /*token_depth==0 &&*/ iter_16tk==0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            //     printf("[HIP] [K block] threadIdx=%3d, token_depth=%d, iter_16tk=%d, "
+            //            "[kblock_idx=%3d, kpage_idx=%3d, kpage_offset=%2d], last_ctx_block=%3d, last_ctx_page=%3d, "
+            //            "block idx=%3d,  kblock_offset=%3d, BLOCK_SIZE=%d, PAGE_SIZE=%d\n",
+            //         threadIdx.x, token_depth, iter_16tk, 
+            //         kblock_idx, kpage_idx, kpage_offset, last_ctx_block, last_ctx_page,
+            //         block_table_seq[kblock_idx], kblock_offset, BLOCK_SIZE, PAGE_SIZE); 
             // }
         } 
         __builtin_amdgcn_sched_group_barrier(0x0020, ITERS_16TK, 0);     // VMEM read
@@ -1401,15 +1409,15 @@ __inline__ __device__ void _paged_attention_kernel_Jacob(
     // qk mfma - define lambda: loading K cache
     int DEBUG_TOKEN_DEPTH=0;
     constexpr int n_global_load_per_fragment = HEAD_LOOP*ITERS_16TK;
-    auto load_K_fragment = [&] __device__ (
-        const cache_t* k_ptr, int buf_idx, int kblock[ITERS_16TK], int koffset[ITERS_16TK]) {
+    auto load_K_fragment = [&] __device__ ( // Suppose BLOCK_SIZE=1
+        const cache_t* k_ptr, int buf_idx, int kpage[ITERS_16TK], int koffset[ITERS_16TK]) {
         for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
             for(int iter_16tk = 0; iter_16tk < ITERS_16TK; iter_16tk++){ // 4
-                const int64_t kblock_number = static_cast<int64_t>(kblock[iter_16tk]);
-                const int64_t kblock_offset = static_cast<int64_t>(koffset[iter_16tk]);
+                const int64_t kpage_number = static_cast<int64_t>(kpage[iter_16tk]);
+                const int64_t kpage_offset = static_cast<int64_t>(koffset[iter_16tk]);
                 const int offset = 
-                    kblock_number * kv_block_stride + 
-                    kblock_offset * HEAD_SIZE + 
+                    kpage_number * kv_block_stride + 
+                    kpage_offset * HEAD_SIZE + 
                     lane16id * CONTIGUOUS_KV_ELEMS_16B_LOAD;
                 const _B16x8* k_ptr_B16x8 = reinterpret_cast<const _B16x8*>(k_ptr + offset);
 
@@ -1492,7 +1500,7 @@ __inline__ __device__ void _paged_attention_kernel_Jacob(
     };
     
     // qk mfma - Preload the kphysical_block_number[0] cache
-    load_K_fragment(k_ptr, curr, kphysical_block_number[0], kphysical_offset[0]);
+    load_K_fragment(k_ptr, curr, kphysical_page_number[0], kphysical_offset[0]);
     __builtin_amdgcn_sched_group_barrier(0x0020, n_global_load_per_fragment, 0);     // VMEM read
 
     // qk mfma - Setup alibi_slope
@@ -1530,7 +1538,7 @@ __inline__ __device__ void _paged_attention_kernel_Jacob(
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) { // 4
         // Preload the next K cache
         if (token_depth + 1 < TLOOP){
-            load_K_fragment(k_ptr, next, kphysical_block_number[token_depth+1], kphysical_offset[token_depth+1]);
+            load_K_fragment(k_ptr, next, kphysical_page_number[token_depth+1], kphysical_offset[token_depth+1]);
             __builtin_amdgcn_sched_group_barrier(0x0020, n_global_load_per_fragment, 0);     // VMEM read
         }
 

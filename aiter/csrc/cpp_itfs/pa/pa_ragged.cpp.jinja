@@ -69,7 +69,10 @@ void {{func_name}}(void* out_ptr,
     dim3 block(NTHR);
 
     constexpr int VERSION_ID = {{"0" if version == 'GOLDEN' else "1" if version == 'JACOB' else "0"}};
+    // constexpr int page_size = {{page_size}};
+    // printf("[AITER DEBUG] page_size: %d \n", page_size);
     // printf("[AITER DEBUG] Running QKV version: %s \n", "{{ version }}");
+    
     
     paged_attention_ll4mi_QKV_mfma16_kernel<VERSION_ID,
                                             {{dtype}},                       
@@ -78,7 +81,8 @@ void {{func_name}}(void* out_ptr,
                                             vllm::Fp8KVCacheDataType::kAuto,
                                             {% else %}
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
-                                            {% endif %}                 
+                                            {% endif %}  
+                                            {{page_size}},                 
                                             {{block_size}},              
                                             head_size,               
                                             NTHR,                    

@@ -18,6 +18,7 @@ def compile(
     kv_dtype: str,
     fp8_kv_dtype: str,
     out_dtype: str,
+    page_size: int,
     block_size: int,
     alibi_enabled: bool = False,
     partition_size: int = 256,
@@ -60,6 +61,7 @@ def compile(
         kv_dtype=kv_dtype,
         fp8_kv_dtype=fp8_kv_dtype,
         out_dtype=out_dtype,
+        page_size=page_size,
         block_size=block_size,
         partition_size=partition_size,
         mtp=mtp,
@@ -81,6 +83,7 @@ def paged_attention_ragged(
     kv_indptr,
     kv_page_indices,  # [num_seqs, max_num_blocks_per_seq]dd
     kv_last_page_lens,  # [num_seqs]
+    page_size,          # New parameter
     block_size,
     max_num_partitions,
     alibi_slopes,
@@ -95,6 +98,7 @@ def paged_attention_ragged(
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
+    # print(f"[DEBUG] page_size={page_size}")
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
     # print(f"[DEBUG] kv_cache_dtype={kv_cache_dtype}, warpSize={warpSize}")
@@ -186,6 +190,7 @@ def paged_attention_ragged(
         kv_dtype,
         kv_cache_dtype,
         out_dtype,
+        page_size,
         block_size,
         alibi_slopes is not None,
         partition_size,

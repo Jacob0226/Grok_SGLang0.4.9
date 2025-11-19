@@ -673,7 +673,7 @@ class AiterAttnBackend(AttentionBackend):
             k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
             # Debug. Save input data to the file
-            self.count += 1
+            # self.count += 1
             # version = os.getenv('QKV_VERSION', 'GOLDEN')
             # if layer.layer_id == 0 and self.tp_rank==1:
             #     kv_indptr  = self.forward_metadata.kv_indptr
@@ -685,46 +685,46 @@ class AiterAttnBackend(AttentionBackend):
             #     print(f"kv_indices.shape={kv_indices.shape}, kv_indices={kv_indices[:20]}")
             #     print(f"K_cache.shape={K_cache.shape}")
 
-            kv_indptr  = self.forward_metadata.kv_indptr
-            n_token = kv_indptr[1] - kv_indptr[0]
-            if layer.layer_id == 0 and self.tp_rank==0:
-                    print(f"[DEBUG] n_token={n_token}, self.count={self.count}")
-            if layer.layer_id == 0 and n_token in [257, 2048]: 
-                if self.tp_rank==0:
-                    print(f"[DEBUG] Record!!!!\n")
-                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                        -1, 1, layer.tp_k_head_num, layer.qk_head_dim)
-                v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                        -1, 1, layer.tp_v_head_num, layer.v_head_dim)
-                version = os.getenv('QKV_VERSION', 'GOLDEN')
-                input_data = {
-                    "version": version,
-                    "o": o.clone().detach(),
-                    "workspace_buffer": self.workspace_buffer.clone().detach(),
-                    "q": q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).clone().detach(),
-                    "k_buffer_shape": k_buffer.clone().detach().shape,
-                    "v_buffer_shape": v_buffer.clone().detach().shape,
-                    "scale": self.scale,
-                    "kv_indptr": self.forward_metadata.kv_indptr.clone().detach(),
-                    "kv_indices": self.forward_metadata.kv_indices.clone().detach(),
-                    "kv_last_page_len": self.kv_last_page_len,
-                    "page_size": self.page_size,
-                    "max_num_partitions": self.max_num_partitions,
-                    "alibi_slopes": None,
-                    "kv_cache_dtype": "auto",
-                    "kv_cache_layout": "NHD",
-                    "logits_soft_cap": self.logits_soft_cap,
-                    "k_scale": self.k_scale,
-                    "v_scale": self.v_scale,
-                    "partition_size": _AITER_PARTITION_SIZE_ROCM,
-                }
-                folder = "/home/jacchang/Grok_SGLang0.4.9/prof/1112/data/"
-                output_filename= folder + f"data_rank{self.tp_rank}_token{n_token}_ps{self.page_size}_{version}.pt"
-                try:
-                    torch.save(input_data, output_filename)
-                    print(f"--- Data saving success: {os.path.abspath(output_filename)}, count={self.count} ---")
-                except Exception as e:
-                    print(f"--- Data saving fail: {e}, count={self.count}")
+            # kv_indptr  = self.forward_metadata.kv_indptr
+            # n_token = kv_indptr[1] - kv_indptr[0]
+            # if layer.layer_id == 0 and self.tp_rank==0:
+            #         print(f"[DEBUG] n_token={n_token}, self.count={self.count}")
+            # if layer.layer_id == 0 and n_token in [257, 2048]: 
+            #     if self.tp_rank==0:
+            #         print(f"[DEBUG] Record!!!!\n")
+            #     k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            #             -1, 1, layer.tp_k_head_num, layer.qk_head_dim)
+            #     v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            #             -1, 1, layer.tp_v_head_num, layer.v_head_dim)
+            #     version = os.getenv('QKV_VERSION', 'GOLDEN')
+            #     input_data = {
+            #         "version": version,
+            #         "o": o.clone().detach(),
+            #         "workspace_buffer": self.workspace_buffer.clone().detach(),
+            #         "q": q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).clone().detach(),
+            #         "k_buffer_shape": k_buffer.clone().detach().shape,
+            #         "v_buffer_shape": v_buffer.clone().detach().shape,
+            #         "scale": self.scale,
+            #         "kv_indptr": self.forward_metadata.kv_indptr.clone().detach(),
+            #         "kv_indices": self.forward_metadata.kv_indices.clone().detach(),
+            #         "kv_last_page_len": self.kv_last_page_len,
+            #         "page_size": self.page_size,
+            #         "max_num_partitions": self.max_num_partitions,
+            #         "alibi_slopes": None,
+            #         "kv_cache_dtype": "auto",
+            #         "kv_cache_layout": "NHD",
+            #         "logits_soft_cap": self.logits_soft_cap,
+            #         "k_scale": self.k_scale,
+            #         "v_scale": self.v_scale,
+            #         "partition_size": _AITER_PARTITION_SIZE_ROCM,
+            #     }
+            #     folder = "/home/jacchang/Grok_SGLang0.4.9/prof/1112/data/"
+            #     output_filename= folder + f"data_rank{self.tp_rank}_token{n_token}_ps{self.page_size}_{version}.pt"
+            #     try:
+            #         torch.save(input_data, output_filename)
+            #         print(f"--- Data saving success: {os.path.abspath(output_filename)}, count={self.count} ---")
+            #     except Exception as e:
+            #         print(f"--- Data saving fail: {e}, count={self.count}")
             
 
             # print(f"[DEBUG] self.tp_rank={self.tp_rank}, layer.layer_id={layer.layer_id}")
@@ -733,26 +733,18 @@ class AiterAttnBackend(AttentionBackend):
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 self.workspace_buffer,
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                # K_cache/V_cache are hardcoded into (-1, 1, tp_k/v_head_num, qk_head_dim)
-                # But we need (block_num, tp_k_head_num, page_size, qk_head_dim)
-                # forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                #     -1, 1, layer.tp_k_head_num, layer.qk_head_dim
-                # ),
-                # forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                #     -1, 1, layer.tp_v_head_num, layer.v_head_dim
-                # ),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                    -1, layer.tp_k_head_num, self.page_size, layer.qk_head_dim
+                    -1, 1, layer.tp_k_head_num, layer.qk_head_dim
                 ),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                    -1, layer.tp_v_head_num, self.page_size, layer.v_head_dim
+                    -1, 1, layer.tp_v_head_num, layer.v_head_dim
                 ),
-
                 self.scale,
                 self.forward_metadata.kv_indptr,
                 self.forward_metadata.kv_indices,
                 self.kv_last_page_len,
-                self.page_size, # original: 1
+                self.page_size, # New Arg
+                1,              # block size
                 self.max_num_partitions,
                 None,
                 "auto",
