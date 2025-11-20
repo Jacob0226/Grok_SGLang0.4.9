@@ -127,56 +127,29 @@ def kv_ptr_factory(
     return kv_indptr, kv_page_indices.reshape(-1)
 
 def run_aiter(
-    query,      # [bs=512, qhead=6, head_dim=128]
+    output,
+    workspace_buffer,
+    query,
     key_cache,
     value_cache,
+    scale,
     kv_indptr,
     kv_page_indices,
-    kv_last_page_lens,
-    page_size,
-    max_seq_len,
+    kv_last_page_len,
+    page_size,      # New args
+    block_size,
+    max_num_partitions,
+    alibi_slopes,
     kv_cache_dtype,
     kv_cache_layout,
-    num_kv_heads,
-    scale,
-    alibi_slopes,
     logits_soft_cap,
     k_scale,
     v_scale,
+    fp8_out_scale,
+    _PARTITION_SIZE_ROCM,
     version="GOLDEN",
 ):
     os.environ['QKV_VERSION'] = version
-    # copied from ops.PagedAttention.forward_decode()
-    _PARTITION_SIZE_ROCM = 256
-    fp8_out_scale = None
-
-    num_seqs, num_heads, head_size = query.shape
-    block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
-
-    output = torch.empty_like(query)
-    max_num_partitions = (
-        max_seq_len + _PARTITION_SIZE_ROCM - 1
-    ) // _PARTITION_SIZE_ROCM
-    assert _PARTITION_SIZE_ROCM % block_size == 0
-
-    # will use single workspace buffer to accommodate following 3 intermediate tensors:
-    #   1. tmp_output (shape=(num_seqs, num_heads, max_num_partitions, head_size), dtype=output.dtype)
-    #   2. exp_sums (shape=(num_seqs, num_heads, max_num_partitions), dtype=float32)
-    #   3. max_logits (shape=(num_seqs, num_heads, max_num_partitions), dtype=float32)
-
-    nbyes_per_qo_elem = torch.finfo(output.dtype).bits // 8
-    workspace_buffer = torch.empty(
-        (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
-        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
-        dtype=torch.uint8,
-        device=output.device,
-    )
-
-    cpa_fp8_out = False
-    if fp8_out_scale is not None:
-        output = torch.empty_like(output, dtype=dtypes.fp8)
-        cpa_fp8_out = True
-    # print(f"[DEBUG] torch.ops.aiter.paged_attention_ragged, _schemas={torch.ops.aiter.paged_attention_ragged._schemas}")
     torch.ops.aiter.paged_attention_ragged(
         output,
         workspace_buffer,
@@ -186,7 +159,7 @@ def run_aiter(
         scale,
         kv_indptr,
         kv_page_indices,
-        kv_last_page_lens,
+        kv_last_page_len,
         page_size,      # New args
         block_size,
         max_num_partitions,
@@ -196,13 +169,11 @@ def run_aiter(
         logits_soft_cap,
         k_scale,
         v_scale,
-        fp8_out_scale if cpa_fp8_out else None,
+        fp8_out_scale,
         _PARTITION_SIZE_ROCM,
     )
 
-  
-
-    if cpa_fp8_out:
+    if fp8_out_scale:
         return workspace_buffer, output.view(num_seqs, num_heads * head_size)
     else:
         return workspace_buffer, output
@@ -210,6 +181,7 @@ def run_aiter(
         
 
 def test_paged_attention(
+    in_pt:str,
     ctx_lens: int,
     num_seqs: int,
     num_heads: Tuple[int, int],
@@ -232,71 +204,130 @@ def test_paged_attention(
     torch.set_default_device(device) 
     block_size = 1
 
-    # Using default kv_scale
-    k_scale = v_scale = torch.tensor([1.0], dtype=dtypes.fp32)
-    scale = float(1.0 / (head_size**0.5))
-    num_query_heads, num_kv_heads = num_heads
-    alibi_slopes = None
-    if use_alibi:
-        alibi_slopes = torch.randn(num_query_heads, dtype=dtypes.fp32)
-    assert num_query_heads % num_kv_heads == 0
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    max_seq_len = ctx_lens
-    padded_ctx_lens = page_size * int(np.ceil(max_seq_len / page_size)) # e.g.,
-    num_blocks = padded_ctx_lens * num_seqs
+    if in_pt == None:
+        # Using default kv_scale
+        k_scale = v_scale = torch.tensor([1.0], dtype=dtypes.fp32)
+        scale = float(1.0 / (head_size**0.5))
+        num_query_heads, num_kv_heads = num_heads
+        alibi_slopes = None
+        if use_alibi:
+            alibi_slopes = torch.randn(num_query_heads, dtype=dtypes.fp32)
+        assert num_query_heads % num_kv_heads == 0
+        num_queries_per_kv = num_query_heads // num_kv_heads
+        max_seq_len = ctx_lens
+        padded_ctx_lens = page_size * int(np.ceil(max_seq_len / page_size)) # e.g.,
+        num_blocks = padded_ctx_lens * num_seqs
+        
+        # prepare inputs & golden output
+        query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
+        query.uniform_(*uniform_range)
+
+        # Create the KV caches.
+        key_caches, value_caches = kv_cache_factory_v2(
+            num_blocks,
+            page_size,
+            1,
+            num_kv_heads,
+            head_size,
+            kv_cache_dtype,
+            dtype,
+            seed,
+            device,
+        )
+        key_cache, value_cache = key_caches[0], value_caches[0]
+        kv_indptr, kv_page_indices = kv_ptr_factory(num_seqs, ctx_lens, page_size)
+        kv_last_page_len = torch.tensor([block_size for i in range(num_seqs)], dtype=torch.int)
+        block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
+    else: # Load from pt
+        gpu_index = torch.cuda.current_device()
+        TARGET_DEVICE = torch.device('cuda:0')
+
+        data = torch.load(in_pt)
+        query = data['q'].clone().detach().to(TARGET_DEVICE)
+        workspace = torch.empty(*data['workspace_buffer_shape']).to(TARGET_DEVICE)
+        key_cache = torch.empty(*data['k_buffer_shape']).to(TARGET_DEVICE)
+        value_cache = torch.empty(*data['v_buffer_shape']).to(TARGET_DEVICE)
+        kv_indptr = data['kv_indptr'].clone().detach().to(TARGET_DEVICE)
+        kv_page_indices = data['kv_indices'].clone().detach().to(TARGET_DEVICE)
+        kv_last_page_len = data['kv_last_page_len'].clone().detach().to(TARGET_DEVICE)
+        page_size = data['page_size']
+        block_size = data['block_size']
+        max_seq_len = kv_indptr[1] - kv_indptr[0]
+        kv_cache_dtype = data['kv_cache_dtype']
+        kv_cache_layout = data['kv_cache_layout']
+        scale = data['scale']
+        alibi_slopes = data['alibi_slopes'].to(TARGET_DEVICE) if isinstance(data['alibi_slopes'], torch.Tensor) else data['alibi_slopes']
+        logits_soft_cap = data['logits_soft_cap']
+        k_scale = data['k_scale']
+        v_scale = data['v_scale']
 
 
-    # prepare inputs & golden output
-  
-    query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
-    query.uniform_(*uniform_range)
+    _PARTITION_SIZE_ROCM = 256
+    fp8_out_scale = None
+    num_seqs, num_heads, head_size = query.shape
+    max_num_partitions = (
+        max_seq_len + _PARTITION_SIZE_ROCM - 1
+    ) // _PARTITION_SIZE_ROCM
+    assert _PARTITION_SIZE_ROCM % block_size == 0
 
-    # Create the KV caches.
-    key_caches, value_caches = kv_cache_factory_v2(
-        num_blocks,
-        page_size,
-        1,
-        num_kv_heads,
-        head_size,
-        kv_cache_dtype,
-        dtype,
-        seed,
-        device,
+    # will use single workspace buffer to accommodate following 3 intermediate tensors:
+    #   1. tmp_output (shape=(num_seqs, num_heads, max_num_partitions, head_size), dtype=output.dtype)
+    #   2. exp_sums (shape=(num_seqs, num_heads, max_num_partitions), dtype=float32)
+    #   3. max_logits (shape=(num_seqs, num_heads, max_num_partitions), dtype=float32)
+    output = torch.empty_like(query)
+    nbyes_per_qo_elem = torch.finfo(output.dtype).bits // 8
+    workspace_buffer = torch.empty(
+        (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
+        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+        dtype=torch.uint8,
+        device=output.device,
     )
-    key_cache, value_cache = key_caches[0], value_caches[0]
-    kv_indptr, kv_page_indices = kv_ptr_factory(num_seqs, ctx_lens, page_size)
-    kv_last_page_lens = torch.tensor([block_size for i in range(num_seqs)], dtype=torch.int)
-    # print(f"[DEBUG pa_unit_test.py]  value_cache.is_contiguous()={value_cache.is_contiguous()}")
-    print(f"[DEBUG] kv_indptr.shape={kv_indptr.shape}, kv_page_indices.shape={kv_page_indices.shape}, kv_last_page_lens.shape={kv_last_page_lens.shape}")
+
+    cpa_fp8_out = False
+    if fp8_out_scale is not None:
+        output = torch.empty_like(output, dtype=dtypes.fp8)
+        cpa_fp8_out = True
+    torch.cuda.synchronize()
+    
+    # print(f"output.shape={output.shape}")
+    # print(f"workspace_buffer.shape={workspace_buffer.shape}")
+    # print(f"query.shape={query.shape}")
+    # print(f"key_cache.shape={key_cache.shape}")
+    # print(f"value_cache.shape={value_cache.shape}")
+    # print(f"kv_indptr.shape={kv_indptr.shape}")
+    print(f"[DEBUG pa_unit_test.py]  value_cache.is_contiguous()={value_cache.is_contiguous()}")
+    print(f"[DEBUG] kv_indptr.shape={kv_indptr.shape}, kv_page_indices.shape={kv_page_indices.shape}, kv_last_page_len.shape={kv_last_page_len.shape}")
     print(f"[DEBUG] key_cache.shape={key_cache.shape}, value_cache.shape={value_cache.shape}")
     print(f"[DEBUG] kv_page_indices={kv_page_indices}")
     print(f"[DEBUG] kv_indptr[-10:]={kv_indptr[-10:]}")
     print(f"[DEBUG] kv_page_indices.max()={kv_page_indices.max()}, num_seqs*ctx_lens={num_seqs*ctx_lens}")
-    # kv_page_indices[:] = 1
-    # exit(0)
-    # print(f"[DEBUG] kv_last_page_lens={kv_last_page_lens}")
+    print(f"[DEBUG] kv_last_page_len={kv_last_page_len}")
     # print(f"kv_indptr={kv_indptr}")
     
+    
     ARGS_TUPLE = (
+        output,
+        workspace_buffer,
         query,
         key_cache.contiguous(),
         value_cache.contiguous(),
+        scale,
         kv_indptr,
         kv_page_indices,
-        kv_last_page_lens,
-        page_size,
-        max_seq_len,
+        kv_last_page_len,
+        page_size,  # New args
+        block_size,
+        max_num_partitions,
+        alibi_slopes,
         kv_cache_dtype,
         kv_cache_layout,
-        num_kv_heads,
-        scale,
-        alibi_slopes,
-        logits_soft_cap,
+        logits_soft_cap,        
         k_scale,
         v_scale,
+        fp8_out_scale if cpa_fp8_out else None,
+        _PARTITION_SIZE_ROCM,
     )
 
-    
     # Warmup
     for i in range(warmup_iter):
         _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
@@ -420,6 +451,12 @@ if __name__ == "__main__":
         help="block size(page size)",
     )
     parser.add_argument(
+        "--in-pt",
+        type=str,
+        default=None,
+        help="Load data from pt file"
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=5,
@@ -438,6 +475,7 @@ if __name__ == "__main__":
 
     page_size = args.page_size # Original block size is 1
     test_paged_attention(
+        args.in_pt,
         ctx_len, 
         args.n,
         (6, 1),      # num_heads: query and KV
