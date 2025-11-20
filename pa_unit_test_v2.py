@@ -12,6 +12,7 @@ from einops import rearrange
 import argparse
 import os
 import numpy as np
+from aiter import paged_attention_ragged
 
 uniform_range = (-1, 1)
 class PAVariant(Enum):
@@ -175,6 +176,7 @@ def run_aiter(
     if fp8_out_scale is not None:
         output = torch.empty_like(output, dtype=dtypes.fp8)
         cpa_fp8_out = True
+    # print(f"[DEBUG] torch.ops.aiter.paged_attention_ragged, _schemas={torch.ops.aiter.paged_attention_ragged._schemas}")
     torch.ops.aiter.paged_attention_ragged(
         output,
         workspace_buffer,
@@ -185,7 +187,7 @@ def run_aiter(
         kv_indptr,
         kv_page_indices,
         kv_last_page_lens,
-        # page_size,
+        page_size,      # New args
         block_size,
         max_num_partitions,
         alibi_slopes,
@@ -197,6 +199,8 @@ def run_aiter(
         fp8_out_scale if cpa_fp8_out else None,
         _PARTITION_SIZE_ROCM,
     )
+
+  
 
     if cpa_fp8_out:
         return workspace_buffer, output.view(num_seqs, num_heads * head_size)
@@ -237,8 +241,8 @@ def test_paged_attention(
     assert num_query_heads % num_kv_heads == 0
     num_queries_per_kv = num_query_heads // num_kv_heads
     max_seq_len = ctx_lens
-    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
-    num_blocks = max_num_blocks_per_seq * num_seqs
+    padded_ctx_lens = page_size * int(np.ceil(max_seq_len / page_size)) # e.g.,
+    num_blocks = padded_ctx_lens * num_seqs
 
 
     # prepare inputs & golden output
