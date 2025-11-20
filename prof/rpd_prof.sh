@@ -5,6 +5,7 @@ set -x
 export BS=512     # Batch Size
 export ILEN=256   # Input Length (Context Length)
 export OLEN=2048  # Output Length (Max generated tokens)
+unset HIP_VISIBLE_DEVICES
 
 # Define the list of PageSize values to loop through
 PAGE_SIZES=(1 16)

@@ -228,6 +228,7 @@ def test_paged_attention(
 ) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
+    np.random.seed(seed)
     torch.set_default_device(device) 
     block_size = 1
 
@@ -269,7 +270,8 @@ def test_paged_attention(
     print(f"[DEBUG] kv_indptr.shape={kv_indptr.shape}, kv_page_indices.shape={kv_page_indices.shape}, kv_last_page_lens.shape={kv_last_page_lens.shape}")
     print(f"[DEBUG] key_cache.shape={key_cache.shape}, value_cache.shape={value_cache.shape}")
     print(f"[DEBUG] kv_page_indices={kv_page_indices}")
-    # print(f"[DEBUG] kv_page_indices.max()={kv_page_indices.max()}, num_seqs*ctx_lens={num_seqs*ctx_lens}")
+    print(f"[DEBUG] kv_indptr[-10:]={kv_indptr[-10:]}")
+    print(f"[DEBUG] kv_page_indices.max()={kv_page_indices.max()}, num_seqs*ctx_lens={num_seqs*ctx_lens}")
     # kv_page_indices[:] = 1
     # exit(0)
     # print(f"[DEBUG] kv_last_page_lens={kv_last_page_lens}")
@@ -341,7 +343,6 @@ def test_paged_attention(
             blocks.append(block)
         return blocks
     
-    # 定义用于 allclose 的容忍度
     def NumericCheck(
         golden_tensor: torch.Tensor,
         jacob_tensor: torch.Tensor,
@@ -349,12 +350,13 @@ def test_paged_attention(
         rtol: float = 1e-5,
         atol: float = 1e-8,
         max_display: int = 5):
-
+        golden_tensor = golden_tensor.reshape(-1)
+        jacob_tensor = jacob_tensor.reshape(-1)
         mismatch_mask = torch.abs(golden_tensor - jacob_tensor) > (atol + rtol * torch.abs(jacob_tensor))
         mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
         mismatch_count = mismatch_mask.sum().item()
         if mismatch_count > 0:
-            num_to_display = min(10, mismatch_count)
+            num_to_display = min(5, mismatch_count)
             print(f"Numeric Check [{name} Failed] Elem count: {exp_sums_golden.numel()}, mismatch_count = {mismatch_count}")
             for i in range(num_to_display):
                 idx = mismatch_indices[i].item()
