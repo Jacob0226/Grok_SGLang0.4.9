@@ -1306,7 +1306,7 @@ __inline__ __device__ void _paged_attention_kernel_Jacob(
             const int kpage_offset = kglobal_token_idx - kpage_idx; // Suppose BLOCK_SIZE=1
             kphysical_page_number[token_depth][iter_16tk] = block_table_seq[kpage_idx];
             kphysical_offset[token_depth][iter_16tk] = kpage_offset;
-       
+  
             // if (threadIdx.x %16==0 && /*token_depth==0 &&*/ iter_16tk==0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
             //     printf("[HIP] [K block] threadIdx=%3d, token_depth=%d, iter_16tk=%d, "
             //            "[kblock_idx=%3d, kpage_idx=%3d, kpage_offset=%2d], last_ctx_block=%3d, last_ctx_page=%3d, "
